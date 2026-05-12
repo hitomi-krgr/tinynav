@@ -118,7 +118,7 @@ def search_close_to_sdf_map(start_index:tuple, sdf_map:np.ndarray, occupancy_map
 def search_within_sdf_map( start:tuple, goal:tuple, sdf_map:np.ndarray, occupancy_map:np.ndarray, resolution: float):
     start = tuple(start.flatten()) if isinstance(start, np.ndarray) else start
     goal = tuple(goal.flatten()) if isinstance(goal, np.ndarray) else goal
-    sdf_bins = [0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+    sdf_bins = [0.5, 1.0, 2.0, 5.0, 10.0] #[0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
 
     def get_queue_index(sdf_value: float) -> int:
         for idx, threshold in enumerate(sdf_bins):
