@@ -257,9 +257,13 @@ def generate_predefined_trajectory_vocabularies(
 @njit(cache=True)
 def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safety_radius=0.1,
                                 front_len=0.35, rear_len=0.35, half_w=0.15):
-    """Score trajectories by minimum ESDF clearance across the robot footprint (center + 4 corners)."""
+    """Score trajectories by minimum ESDF clearance across the robot footprint (center + 4 corners).
+    Continuous score: strong penalty near obstacles, mild preference for centered (away from walls)
+    in the safe region so multiple equally-safe candidates can be broken in favor of higher clearance."""
     scores = []
     occ_points = []
+    centering_cap = 1.0  # clearance beyond this gives no extra bonus
+    centering_max = 0.001  # max safe-region score; × 100000 in cost function ≈ 100
     ESDF_rows, ESDF_cols = ESDF_map.shape
 
     for t in range(len(trajectories)):
@@ -311,13 +315,14 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
         if min_dist_for_traj < 1e-3:  # collision
             scores.append(float('inf'))
         elif min_dist_for_traj != float('inf'):
-            if min_dist_for_traj > safety_radius:
-                scores.append(0.0)
-            else:
+            if min_dist_for_traj < safety_radius:
                 max_steps = len(traj)
                 decay_factor = (max_steps - closest_step_for_traj) / max_steps
                 base_score = 1.0 / (min_dist_for_traj + 1e-3)
                 scores.append(decay_factor * base_score)
+            else:
+                clearance = min(min_dist_for_traj, centering_cap)
+                scores.append(centering_max * (centering_cap - clearance) / centering_cap)
         else:
             scores.append(0.0)
         occ_points.append(closest_step_for_traj)
