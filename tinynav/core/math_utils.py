@@ -220,6 +220,7 @@ def rerank_by_pnp_inliers(
     K: np.ndarray,
     min_point_count: int = 80,
     min_inlier_count: int = 50,
+    min_inlier_ratio: float = 0.5,
 ) -> tuple[bool, np.ndarray, float, int, int, int]:
     """
     Estimate PnP for each candidate and return the pose with the most inliers.
@@ -229,6 +230,7 @@ def rerank_by_pnp_inliers(
         K: camera intrinsic matrix.
         min_point_count: minimum number of 3D/2D correspondences required.
         min_inlier_count: minimum number of PnP inliers required.
+        min_inlier_ratio: minimum PnP inlier ratio required (rejects perceptual-aliasing matches).
 
     Returns:
         success, pose, inlier_ratio, best_candidate_index, best_inlier_count, best_point_count.
@@ -246,6 +248,8 @@ def rerank_by_pnp_inliers(
         success, rvec, tvec, inliers = cv2.solvePnPRansac(points_3d, points_2d, K, None)
         inlier_count = 0 if inliers is None else len(inliers)
         if not success or inliers is None or inlier_count < min_inlier_count:
+            continue
+        if inlier_count / point_count < min_inlier_ratio:
             continue
 
         if inlier_count > best_inlier_count:
