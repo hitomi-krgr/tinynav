@@ -122,6 +122,8 @@ class BackendNode(Ros2NodeManager):
         self._grid_info: dict | None = None
         self._nav_target_pose: dict | None = None
 
+        self._vio_status: str = ''
+
         # Debug recording (independent of main state machine)
         self._debug_record_proc: subprocess.Popen | None = None
         self._debug_record_path: str | None = None
@@ -150,6 +152,9 @@ class BackendNode(Ros2NodeManager):
         )
         self.create_subscription(
             PointCloud2, '/planning/occupied_voxels', self._on_occupied_voxels, 1
+        )
+        self.create_subscription(
+            String, '/insight/vio_status', self._on_vio_status, 10
         )
 
         self._tf_buffer = tf2_ros.Buffer()
@@ -589,6 +594,10 @@ class BackendNode(Ros2NodeManager):
         except Exception:
             pass
 
+    def _on_vio_status(self, msg: String):
+        with self._lock:
+            self._vio_status = msg.data
+
     # ------------------------------------------------------------------ #
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
@@ -781,6 +790,10 @@ class BackendNode(Ros2NodeManager):
         except Exception:
             return
         self._publish_preview_frame(topic, arr)
+
+    def get_vio_status(self) -> str:
+        with self._lock:
+            return self._vio_status
 
     def get_planning_snapshot(self) -> dict:
         with self._lock:
