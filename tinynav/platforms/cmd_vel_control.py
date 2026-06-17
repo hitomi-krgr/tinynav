@@ -26,6 +26,15 @@ class CmdVelControlNode(Node):
             [1, 0, 0, 0],
             [0, 0, 0, 1]]
         )
+        # The odometry is the CAMERA pose, but planner path poses are CONTROL-CENTER
+        # poses and the camera sits this far AHEAD of the control center
+        # (B2: camera_x - control_x = 0.5 - (-0.5) = 1.0 m). The closed-loop heading
+        # MUST be referenced at the control center, otherwise the short (~1 m)
+        # control-center path lies behind the camera -> heading_err ~ +/-pi -> the
+        # robot rotates in place forever and cannot move. (Diagnosed from a bag.)
+        self.cam_forward_offset = 1.0
+        self.T_camera_to_control = self.T_robot_to_camera.copy()
+        self.T_camera_to_control[2, 3] = -self.cam_forward_offset  # back along camera +z (=forward)
         self.last_path_time = 0.0
         self.pose = None
         self.path = None
@@ -47,16 +56,24 @@ class CmdVelControlNode(Node):
         self.path_period_ema = 0.12
         self.path_filter_tau = 0.30
         self.lookahead_steps = 1
+        self.lookahead_distance = 0.8
+        self.yaw_kp = 0.4
+        self.yaw_p_ff_max = 0.4
+        self.yaw_kd = 0.0
+        self._prev_heading_err = None
         # Static-friction compensation: very small vx often cannot move the robot.
         self.min_effective_linear_speed = 0.1
         self.min_effective_angular_speed = 0.1
         self.linear_engage_threshold = 0.04
         self.fixed_reverse_speed = 0.2
-        # Hack: if path first segment points far away from robot heading,
-        # rotate in place instead of publishing near-zero cmd_vel.
         self.force_turn_heading_threshold = np.deg2rad(80.0)
+        self.rotate_first_heading_threshold = 0.45
+        self.rotate_first_gain = 1.6
 
         self.latest_cmd = Twist()
+        self.target_point_world = None
+        self.path_vyaw_ff = 0.0
+        self.is_backward_segment = False
         self.prev_cmd = Twist()
         self.last_cmd_pub_time = time.monotonic()
         self.last_path_update_time = None
@@ -90,6 +107,57 @@ class CmdVelControlNode(Node):
     def _clamp_step(self, target: float, current: float, max_delta: float) -> float:
         return float(np.clip(target - current, -max_delta, max_delta) + current)
 
+    @staticmethod
+    def _pose_to_T(pose_msg) -> np.ndarray:
+        T = np.eye(4)
+        position = pose_msg.pose.position
+        rot = pose_msg.pose.orientation
+        quat = [rot.x, rot.y, rot.z, rot.w]
+        T[:3, :3] = R.from_quat(quat).as_matrix()
+        T[:3, 3] = np.array([position.x, position.y, position.z]).ravel()
+        return T
+
+    @staticmethod
+    def _pose_xy(pose_msg) -> np.ndarray:
+        """Just the (x, y) position — avoids quaternion math when only the
+        translation is needed (e.g. the lookahead distance scan)."""
+        p = pose_msg.pose.position
+        return np.array([p.x, p.y])
+
+    def _closed_loop_yaw(self, target_cmd, heading_err, dt):
+        """Set target_cmd.angular.z (and zero linear.x for rotate-in-place) from the
+        live heading error: path feedforward + PD, gated so a hard planner turn isn't
+        amplified. Two rotate-in-place tiers mirror the prior path-frame gates, now
+        driven by the measured pose."""
+        gentle = abs(self.path_vyaw_ff) < self.yaw_p_ff_max
+        # D term damps overshoot when the steer target switches quickly (slalom).
+        # Reset prev when not correcting so the derivative doesn't spike after a gap.
+        dherr = 0.0 if self._prev_heading_err is None else (heading_err - self._prev_heading_err) / dt
+        self._prev_heading_err = heading_err
+        pd = self.yaw_kp * heading_err + self.yaw_kd * dherr
+        vyaw = self.path_vyaw_ff + (pd if gentle else 0.0)
+        if abs(heading_err) > self.force_turn_heading_threshold:
+            target_cmd.linear.x = 0.0
+            vyaw = heading_err
+        elif target_cmd.linear.x > 0.0 and abs(heading_err) > self.rotate_first_heading_threshold:
+            target_cmd.linear.x = 0.0
+            vyaw = self.rotate_first_gain * heading_err
+        target_cmd.angular.z = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
+
+    def _live_heading_err(self):
+        """Heading error (rad) of the stored world-frame target as seen from the
+        robot's LIVE odometry pose. None if pose/target unavailable. This is what
+        closes the loop: the reference is the actual measured pose, not the planned
+        path start, so per-device open-loop yaw drift is corrected each control tick."""
+        if self.pose is None or self.target_point_world is None:
+            return None
+        # Reference frame at the CONTROL CENTER (not the camera), matching the
+        # control-center path poses; target_point_world is the raw world path point.
+        T_world_robot = self._pose_to_T(self.pose.pose) @ self.T_camera_to_control
+        target_world = np.append(self.target_point_world, 1.0)
+        p_robot = np.linalg.inv(T_world_robot) @ target_world
+        return float(np.arctan2(p_robot[1], p_robot[0]))
+
     def cmd_timer_callback(self):
         now = time.monotonic()
         dt = max(1e-3, now - self.last_cmd_pub_time)
@@ -109,7 +177,22 @@ class CmdVelControlNode(Node):
         stale_stop_s = max(self.path_stale_stop_s, self.path_period_ema * self.path_stale_stop_factor)
         target_cmd = Twist()
         target_cmd.linear.x = self.latest_cmd.linear.x
-        target_cmd.angular.z = self.latest_cmd.angular.z
+
+        # Closed-loop yaw: recompute heading error against the LIVE pose every tick,
+        # P term + path feedforward. Falls back to the path-derived feedforward when
+        # no live heading is available (no pose / no target yet).
+        heading_err = self._live_heading_err()
+        if self.is_backward_segment:
+            # Reverse: keep straight, do not chase heading (target is ~+/-pi behind).
+            target_cmd.angular.z = 0.0
+            self._prev_heading_err = None
+        elif heading_err is not None:
+            self._closed_loop_yaw(target_cmd, heading_err, dt)
+        else:
+            # No live heading yet: fall back to the path-derived feedforward.
+            target_cmd.angular.z = self.latest_cmd.angular.z
+            self._prev_heading_err = None
+
         if age > stale_stop_s:
             target_cmd.linear.x = 0.0
             target_cmd.angular.z = 0.0
@@ -172,23 +255,23 @@ class CmdVelControlNode(Node):
             self.path_period_ema = 0.85 * self.path_period_ema + 0.15 * float(period)
         self.last_path_update_time = now_mono
 
-        def msg2np(msg):
-            T = np.eye(4)
-            position = msg.pose.position
-            rot = msg.pose.orientation
-            quat = [rot.x, rot.y, rot.z, rot.w]
-            T[:3, :3] = R.from_quat(quat).as_matrix()
-            T[:3, 3] = np.array([position.x, position.y, position.z]).ravel()
-            return T
-        
-        T1 = msg2np(self.path.poses[0])
+        T1 = self._pose_to_T(self.path.poses[0])
+        # Choose the lookahead pose by distance from the CONTROL CENTER (the heading-
+        # error origin), so it is consistent with where the path is measured. Fall back
+        # to lookahead_steps as a floor and the last pose as a cap.
+        ctrl_xy = (self._pose_to_T(self.pose.pose) @ self.T_camera_to_control)[:2, 3]
         step_idx = int(min(self.lookahead_steps, len(self.path.poses) - 1))
-        T2 = msg2np(self.path.poses[step_idx])
+        for j in range(1, len(self.path.poses)):
+            if np.linalg.norm(self._pose_xy(self.path.poses[j]) - ctrl_xy) >= self.lookahead_distance:
+                step_idx = max(step_idx, j)
+                break
+        else:
+            step_idx = len(self.path.poses) - 1
+        T2 = self._pose_to_T(self.path.poses[step_idx])
         T_robot_1 = T1 @ self.T_robot_to_camera
         T_robot_2 = T2 @ self.T_robot_to_camera
         T_robot_2_to_1 = np.linalg.inv(T_robot_1) @ T_robot_2
         p = T_robot_2_to_1[:3, 3]
-        heading_err = float(np.arctan2(p[1], p[0]))
         # dt must match actual spacing between published Path poses, not raw trajectory dt.
         dt = self.planner_dt * self.path_pose_stride * max(1, step_idx)
         linear_velocity_vec = p / dt
@@ -196,38 +279,24 @@ class CmdVelControlNode(Node):
         angular_velocity_vec = r.as_rotvec() / dt
 
         raw_vx = float(linear_velocity_vec[0])
-        if raw_vx < 0.0:
+        is_backward_segment = raw_vx < 0.0
+        if is_backward_segment:
             vx = -self.fixed_reverse_speed
         else:
             vx = float(np.clip(raw_vx, 0.0, 0.5))
-        vy = 0.0
-        vyaw = np.clip(angular_velocity_vec[2], -self.max_angular_speed, self.max_angular_speed)
-        is_backward_segment = raw_vx < 0.0
-        if is_backward_segment:
-            vyaw = 0.0
 
-        # Hack: if path first segment points >80 deg away from robot heading,
-        # force an in-place turn. Skip explicit backward segments because reverse
-        # naturally has heading_err close to +/-pi.
-        if (not is_backward_segment) and abs(heading_err) > self.force_turn_heading_threshold:
-            vx = 0.0
-            vyaw = float(np.clip(heading_err, -self.max_angular_speed, self.max_angular_speed))
-        # Minimal rotate-first gate: apply only for forward motion.
-        elif vx > 0.0 and abs(heading_err) > 0.45:
-            vx = 0.0
-            vyaw = float(np.clip(1.6 * heading_err, -0.6, 0.6))
-
-        vyaw = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
-
-        # Store the latest target command directly. Smoothing is intentionally kept
-        # only in cmd_timer_callback via acceleration limiting, so planner/control
-        # behavior stays easy to reason about during tuning.
+        # Store the world-frame lookahead target + path feedforward yaw. The closed-loop
+        # heading P term is applied in cmd_timer_callback against the live odometry pose,
+        # so per-device open-loop yaw drift is corrected continuously.
+        self.target_point_world = (T_robot_2[:3, 3]).copy()
+        self.is_backward_segment = is_backward_segment
+        self.path_vyaw_ff = 0.0 if is_backward_segment else float(angular_velocity_vec[2])
         self.latest_cmd.linear.x = float(vx)
-        self.latest_cmd.linear.y = float(vy)
-        self.latest_cmd.angular.z = float(vyaw)
+        self.latest_cmd.linear.y = 0.0
         age = 0.0 if self.last_path_update_time is None else (time.monotonic() - self.last_path_update_time)
         self.logger.debug(
-            f"cmd vx={self.latest_cmd.linear.x:.3f} vyaw={self.latest_cmd.angular.z:.3f} "
+            f"path target_vx={self.latest_cmd.linear.x:.3f} vyaw_ff={self.path_vyaw_ff:.3f} "
+            f"backward={self.is_backward_segment} "
             f"path_age={age:.2f}s path_dt_ema={self.path_period_ema:.2f}s lookahead={step_idx}"
         )
 

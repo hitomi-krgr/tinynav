@@ -151,11 +151,11 @@ def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy
 
 @dataclass
 class ObstacleConfig:
-    robot_z_bottom: float = -0.4
-    robot_z_top: float = 0.4
+    robot_z_bottom: float = -0.7
+    robot_z_top: float = 0.3
     occ_threshold: float = 0.1
     min_wall_span_m: float = 0.2
-    dilation_cells: int = 0
+    dilation_cells: int = 1
 
 
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
@@ -184,13 +184,13 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
 
 @njit(cache=True)
 def generate_trajectory_library_3d(
-    num_samples=15, duration=3.0, dt=0.1,
+    num_samples=11, duration=3.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """Regular sampled lattice (forward-only)."""
     num_steps = int(duration / dt) + 1
 
-    vx_max = 0.5
+    vx_max = 0.3
     n_vx = max(3, int(num_samples / 2))
     vx_samples = np.linspace(0.0, vx_max, n_vx)
     omega_y_samples = np.linspace(-np.pi / 3, np.pi / 3, num_samples)
@@ -350,7 +350,7 @@ def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
 class PlanningNode(Node):
     def __init__(self):
         super().__init__('planning_node')
-        self.robot = GO2_CONFIG
+        self.robot = B2_CONFIG
         self.get_logger().info(
             f"Robot: {self.robot.name} ({self.robot.shape} {self.robot.length}x{self.robot.width}m, "
             f"cam=({self.robot.camera_x},{self.robot.camera_y}), "
@@ -372,8 +372,13 @@ class PlanningNode(Node):
         self.ts.registerCallback(self.sync_callback)
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
-        self.grid_shape = (100, 100, 10)
         self.resolution = 0.1
+        self.obstacle_config = ObstacleConfig()
+        # Derive the grid's z extent and vertical offset from the obstacle band so
+        # the grid covers exactly [robot_z_bottom, robot_z_top] relative to the camera.
+        z_layers = int(round((self.obstacle_config.robot_z_top - self.obstacle_config.robot_z_bottom) / self.resolution))
+        self.grid_shape = (100, 100, z_layers)
+        self.z_grid_drop = -(self.obstacle_config.robot_z_top + self.obstacle_config.robot_z_bottom) / 2
         self.origin = np.array(self.grid_shape) * self.resolution / -2.
         self.step = 10
         self.occupancy_grid = np.zeros(self.grid_shape)
@@ -381,7 +386,6 @@ class PlanningNode(Node):
         self.baseline = None
         self.last_T = None
         self.last_param = (0.0, 0.0) # acc and gyro
-        self.obstacle_config = ObstacleConfig()
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 
@@ -563,9 +567,10 @@ class PlanningNode(Node):
         with Timer(name='raycasting', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             center = self.origin + np.array(self.grid_shape) * self.resolution / 2
             robot_pos = T[:3, 3]
-            delta = robot_pos - center
+            target_center = robot_pos - np.array([0.0, 0.0, self.z_grid_drop])
+            delta = target_center - center
             if np.linalg.norm(delta) > .1:
-                new_center = robot_pos
+                new_center = target_center
                 new_origin = new_center - np.array(self.grid_shape) * self.resolution / 2
                 self.occupancy_grid, self.origin = roll_occupancy_grid(self.occupancy_grid, self.origin, new_origin, self.resolution)
             new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy, self.origin, self.step, self.resolution)
@@ -608,24 +613,7 @@ class PlanningNode(Node):
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             enter_threshold = 0.30
-            K_clear_endpoint = 30.0
             esdf_rows, esdf_cols = ESDF_map.shape
-
-            # Only moving trajs count: vx=0 rotate-in-place is almost always safe
-            # and would otherwise gate out every forward option in tight corridors.
-            any_safe = any(s == 0.0 and abs(p[0]) > 1e-3 for s, p in zip(scores, params))
-
-            fwd = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
-            tgt_dx = tgt_dy = 0.0
-            force_turn = False
-            align_now = 1.0
-            if self.target_pose is not None:
-                tdx, tdy = self.target_pose[0] - T[0, 3], self.target_pose[1] - T[1, 3]
-                norm = float(np.hypot(tdx, tdy))
-                if norm > 1e-6:
-                    tgt_dx, tgt_dy = tdx / norm, tdy / norm
-                    align_now = fwd[0] * tgt_dx + fwd[1] * tgt_dy
-                    force_turn = align_now < np.cos(np.deg2rad(80.0))
 
             def cost_function(traj, param, score, target_pose):
                 # predefined backward trajectory penalty
@@ -633,36 +621,17 @@ class PlanningNode(Node):
                 should_reverse = front_clearance <= enter_threshold
                 reverse_gate_penalty = 1e9 if (should_reverse != is_backward) else 0.0
 
-                # safety_gate: when a fully-clear traj exists, exclude all unsafe ones
-                safety_gate_penalty = 1e9 if (any_safe and score > 0.0) else 0.0
-
-                # heading_penalty: align end_yaw with target dir; over-rotation
-                # lowers alignment so it self-stabilizes without oscillation.
-                heading_penalty = 0.0
-                if force_turn:
-                    if param[0] > 0.0:
-                        heading_penalty = 1e9
-                    else:
-                        qx, qy, qz, qw = traj[-1, 3], traj[-1, 4], traj[-1, 5], traj[-1, 6]
-                        end_fx = 2.0 * (qx * qz + qw * qy)
-                        end_fy = 2.0 * (qy * qz - qw * qx)
-                        heading_penalty = -200.0 * (end_fx * tgt_dx + end_fy * tgt_dy)
-
                 # regular trajectory penalty
                 traj_end = np.array(traj[-1, :3])
                 target_end = target_pose if target_pose is not None else traj_end
                 dist = np.linalg.norm(traj_end - target_end)
 
-                # endpoint clearance reward: prefer trajs ending in wider free space
-                ex = int((traj_end[0] - self.origin[0]) / self.resolution)
-                ey = int((traj_end[1] - self.origin[1]) / self.resolution)
-                end_sdf = float(ESDF_map[ex, ey]) if (0 <= ex < esdf_rows and 0 <= ey < esdf_cols) else 0.0
 
-                return (100 * dist
+                return (score * 100000
+                        + 100 * dist
                         + 10 * abs(self.last_param[0] - param[0])
                         + 10 * abs(self.last_param[1] - param[1])
-                        + reverse_gate_penalty + safety_gate_penalty + heading_penalty
-                        - K_clear_endpoint * end_sdf)
+                        + reverse_gate_penalty)
 
             top_k = 1
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
