@@ -1,0 +1,24 @@
+services:
+  tinynav:
+    image: uniflexai/tinynav:latest
+    container_name: tinynav-dev
+    privileged: true
+    network_mode: host
+    runtime: nvidia
+    stdin_open: true
+    tty: true
+    environment:
+      FRONTEND_PORT: 8080
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+    volumes:
+      - .:/tinynav
+      - ${HOME}/.local/share/tinynav:/root/.local/share/tinynav
+      - /dev:/dev
+      - /etc/localtime:/etc/localtime
+    shm_size: 16gb
+    restart: unless-stopped
+    command: >
+      bash -lc "
+      source /opt/ros/humble/setup.bash;
+      exec bash /tinynav/scripts/start_app.sh
+      "
