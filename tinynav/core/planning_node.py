@@ -184,7 +184,7 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
 
 @njit(cache=True)
 def generate_trajectory_library_3d(
-    num_samples=11, duration=3.0, dt=0.1,
+    num_samples=11, duration=5.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """Regular sampled lattice (forward-only)."""
@@ -226,7 +226,7 @@ def generate_trajectory_library_3d(
 
 
 def generate_predefined_trajectory_vocabularies(
-    duration=3.0, dt=0.1,
+    duration=5.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """
