@@ -59,10 +59,10 @@ GO2_CONFIG = RobotConfig(
 
 B2_CONFIG = RobotConfig(
     name='b2', shape='square',
-    length=1.0, width=0.5,
+    length=0.8, width=0.4,
     camera_x=0.5, camera_y=0.0,
     control_x=-0.5, control_y=0.0,
-    safety_radius=0.1,
+    safety_radius=0.0,
 )
 
 # === Helper functions ===
@@ -193,7 +193,7 @@ def generate_trajectory_library_3d(
     vx_max = 0.3
     n_vx = max(3, int(num_samples / 2))
     vx_samples = np.linspace(0.0, vx_max, n_vx)
-    omega_y_samples = np.linspace(-np.pi / 3, np.pi / 3, num_samples)
+    omega_y_samples = np.linspace(-np.pi / 6, np.pi / 6, num_samples)
 
     num_samples = len(vx_samples) * len(omega_y_samples)
 
@@ -372,7 +372,7 @@ class PlanningNode(Node):
         self.ts.registerCallback(self.sync_callback)
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
-        self.resolution = 0.1
+        self.resolution = 0.05
         self.obstacle_config = ObstacleConfig()
         # Derive the grid's z extent and vertical offset from the obstacle band so
         # the grid covers exactly [robot_z_bottom, robot_z_top] relative to the camera.
