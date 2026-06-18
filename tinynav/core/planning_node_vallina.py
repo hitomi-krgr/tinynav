@@ -59,10 +59,10 @@ GO2_CONFIG = RobotConfig(
 
 B2_CONFIG = RobotConfig(
     name='b2', shape='square',
-    length=1.0, width=0.5,
+    length=0.8, width=0.4,
     camera_x=0.5, camera_y=0.0,
     control_x=-0.5, control_y=0.0,
-    safety_radius=0.1,
+    safety_radius=0.0,
 )
 
 # === Helper functions ===
@@ -155,7 +155,7 @@ class ObstacleConfig:
     robot_z_top: float = 0.3
     occ_threshold: float = 0.1
     min_wall_span_m: float = 0.2
-    dilation_cells: int = 1
+    dilation_cells: int = 0
 
 
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
@@ -193,7 +193,7 @@ def generate_trajectory_library_3d(
     vx_max = 0.3
     n_vx = max(3, int(num_samples / 2))
     vx_samples = np.linspace(0.0, vx_max, n_vx)
-    omega_y_samples = np.linspace(-np.pi / 6, np.pi / 6, num_samples)
+    omega_y_samples = np.linspace(-np.pi / 3, np.pi / 3, num_samples)
 
     num_samples = len(vx_samples) * len(omega_y_samples)
 
