@@ -124,39 +124,28 @@ class CmdVelControlNode(Node):
         p = pose_msg.pose.position
         return np.array([p.x, p.y])
 
-    def _closed_loop_yaw(self, target_cmd, heading_err, dt):
-        """Set target_cmd.angular.z (and zero linear.x for rotate-in-place) from the
-        live heading error: path feedforward + PD, gated so a hard planner turn isn't
-        amplified. Two rotate-in-place tiers mirror the prior path-frame gates, now
-        driven by the measured pose."""
-        gentle = abs(self.path_vyaw_ff) < self.yaw_p_ff_max
-        # D term damps overshoot when the steer target switches quickly (slalom).
-        # Reset prev when not correcting so the derivative doesn't spike after a gap.
-        dherr = 0.0 if self._prev_heading_err is None else (heading_err - self._prev_heading_err) / dt
-        self._prev_heading_err = heading_err
-        pd = self.yaw_kp * heading_err + self.yaw_kd * dherr
-        vyaw = self.path_vyaw_ff + (pd if gentle else 0.0)
-        if abs(heading_err) > self.force_turn_heading_threshold:
-            target_cmd.linear.x = 0.0
-            vyaw = heading_err
-        elif target_cmd.linear.x > 0.0 and abs(heading_err) > self.rotate_first_heading_threshold:
-            target_cmd.linear.x = 0.0
-            vyaw = self.rotate_first_gain * heading_err
-        target_cmd.angular.z = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
-
-    def _live_heading_err(self):
-        """Heading error (rad) of the stored world-frame target as seen from the
-        robot's LIVE odometry pose. None if pose/target unavailable. This is what
-        closes the loop: the reference is the actual measured pose, not the planned
-        path start, so per-device open-loop yaw drift is corrected each control tick."""
-        if self.pose is None or self.target_point_world is None:
+    def _actual_yaw(self):
+        """World heading of the robot's measured forward axis (odometry)."""
+        if self.pose is None:
             return None
-        # Reference frame at the CONTROL CENTER (not the camera), matching the
-        # control-center path poses; target_point_world is the raw world path point.
-        T_world_robot = self._pose_to_T(self.pose.pose) @ self.T_camera_to_control
-        target_world = np.append(self.target_point_world, 1.0)
-        p_robot = np.linalg.inv(T_world_robot) @ target_world
-        return float(np.arctan2(p_robot[1], p_robot[0]))
+        fwd = self._pose_to_T(self.pose.pose)[:3, :3] @ np.array([0.0, 0.0, 1.0])  # optical +z = forward
+        return float(np.arctan2(fwd[1], fwd[0]))
+
+    def _path_intended_yaw(self):
+        """World heading the PLAN intends here: forward axis of the published
+        trajectory pose nearest the control center. None if no path/pose. This is the
+        drift reference — comparing it to the measured heading isolates open-loop yaw
+        drift from the planner's deliberate turning (which the feedforward handles)."""
+        if self.pose is None or self.path is None or len(self.path.poses) == 0:
+            return None
+        ctrl_xy = (self._pose_to_T(self.pose.pose) @ self.T_camera_to_control)[:2, 3]
+        best_i, best_d = 0, float('inf')
+        for i, ps in enumerate(self.path.poses):
+            d = (ps.pose.position.x - ctrl_xy[0]) ** 2 + (ps.pose.position.y - ctrl_xy[1]) ** 2
+            if d < best_d:
+                best_d, best_i = d, i
+        fwd = self._pose_to_T(self.path.poses[best_i])[:3, :3] @ np.array([0.0, 0.0, 1.0])
+        return float(np.arctan2(fwd[1], fwd[0]))
 
     def cmd_timer_callback(self):
         now = time.monotonic()
@@ -181,17 +170,26 @@ class CmdVelControlNode(Node):
         # Closed-loop yaw: recompute heading error against the LIVE pose every tick,
         # P term + path feedforward. Falls back to the path-derived feedforward when
         # no live heading is available (no pose / no target yet).
-        heading_err = self._live_heading_err()
-        if self.is_backward_segment:
-            # Reverse: keep straight, do not chase heading (target is ~+/-pi behind).
-            target_cmd.angular.z = 0.0
-            self._prev_heading_err = None
-        elif heading_err is not None:
-            self._closed_loop_yaw(target_cmd, heading_err, dt)
+        # Closed-loop yaw = planner FEEDFORWARD omega + a small P that only cancels
+        # open-loop HEADING DRIFT. The reference is the planned trajectory's intended
+        # heading (orientation of the nearest published pose), NOT the bearing to a
+        # lookahead point. So the planner decides how much to turn (feedforward); the
+        # loop only nulls the difference between the heading we actually achieved and
+        # the heading the plan intended — i.e. it removes per-device open-loop drift
+        # without re-deciding the motion. No rotate-in-place / force-turn gates.
+        intended_yaw = self._path_intended_yaw()
+        actual_yaw = self._actual_yaw()
+        if intended_yaw is not None and actual_yaw is not None:
+            drift = float(np.arctan2(np.sin(actual_yaw - intended_yaw),
+                                     np.cos(actual_yaw - intended_yaw)))
+            ddrift = 0.0 if self._prev_heading_err is None else (drift - self._prev_heading_err) / dt
+            self._prev_heading_err = drift
+            vyaw = self.path_vyaw_ff - (self.yaw_kp * drift + self.yaw_kd * ddrift)
         else:
-            # No live heading yet: fall back to the path-derived feedforward.
-            target_cmd.angular.z = self.latest_cmd.angular.z
+            # No path/pose yet: pure feedforward.
+            vyaw = self.path_vyaw_ff
             self._prev_heading_err = None
+        target_cmd.angular.z = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
 
         if age > stale_stop_s:
             target_cmd.linear.x = 0.0
@@ -221,10 +219,13 @@ class CmdVelControlNode(Node):
         # and forced rotate-in-place should take effect immediately.
         out.angular.z = float(np.clip(target_cmd.angular.z, -self.max_angular_speed, self.max_angular_speed))
 
-        # Linear x: robot cannot execute tiny non-zero speeds reliably.
-        # When engaging forward motion, snap to +min; when stopping/decaying, snap to 0.
+        # Linear x: robot cannot execute tiny non-zero speeds reliably. When the
+        # planner asks for ANY forward motion (target > 0), creep at +min instead of
+        # snapping to 0 — otherwise a planner command in (0, min) freezes the robot,
+        # which then never advances, never updates its lookahead, and deadlocks (e.g.
+        # at a wall-adjacent waypoint). Only a non-positive target decays to 0.
         if 0.0 < out.linear.x < self.min_effective_linear_speed:
-            out.linear.x = self.min_effective_linear_speed if target_cmd.linear.x >= self.min_effective_linear_speed else 0.0
+            out.linear.x = self.min_effective_linear_speed if target_cmd.linear.x > 0.0 else 0.0
         elif abs(out.linear.x) < self.min_effective_linear_speed:
             out.linear.x = 0.0
 

@@ -17,6 +17,13 @@ from codetiming import Timer
 import cv2
 from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_quat, msg2np
 
+# --- turn-in-the-open tuning ----------------------------------------------
+# "Don't start turning inside a narrow corridor; carry forward until the turn
+#  point sits in open space." Reward trajectories whose turn START (where yaw
+#  first deviates) lands at a high omni-ESDF cell.
+TURN_YAW_EPS = np.deg2rad(15.0)   # |yaw - yaw0| above this => "omega took effect"
+K_TURN_CLEAR = 40.0
+
 
 @dataclass
 class RobotConfig:
@@ -615,6 +622,31 @@ class PlanningNode(Node):
             enter_threshold = 0.30
             esdf_rows, esdf_cols = ESDF_map.shape
 
+            def turn_start_clearance(traj):
+                """ESDF at the point where the trajectory first turns (|yaw - yaw0| >
+                TURN_YAW_EPS); endpoint clearance if it goes straight. ESDF is the
+                omni-directional clearance, so this rewards starting the turn in open
+                space rather than inside a narrow corridor."""
+                def yaw_at(row):
+                    # body +Z is forward -> world heading from the pose rotation
+                    R = quat_to_matrix(np.array([row[3], row[4], row[5], row[6]]))
+                    fwd = R @ np.array([0.0, 0.0, 1.0])
+                    return np.arctan2(fwd[1], fwd[0])
+
+                def esdf_at(xy):
+                    ex = int((xy[0] - self.origin[0]) / self.resolution)
+                    ey = int((xy[1] - self.origin[1]) / self.resolution)
+                    if 0 <= ex < esdf_rows and 0 <= ey < esdf_cols:
+                        return float(ESDF_map[ex, ey])
+                    return 0.0
+
+                yaw0 = yaw_at(traj[0])
+                for i in range(len(traj)):
+                    dyaw = np.arctan2(np.sin(yaw_at(traj[i]) - yaw0), np.cos(yaw_at(traj[i]) - yaw0))
+                    if abs(dyaw) > TURN_YAW_EPS:
+                        return esdf_at(traj[i, :2])
+                return esdf_at(traj[-1, :2])
+
             def cost_function(traj, param, score, target_pose):
                 # predefined backward trajectory penalty
                 is_backward = param[0] < 0.0
@@ -626,12 +658,16 @@ class PlanningNode(Node):
                 target_end = target_pose if target_pose is not None else traj_end
                 dist = np.linalg.norm(traj_end - target_end)
 
+                # turn-in-open: reward beginning the turn at a high-clearance cell so
+                # the planner carries forward through tight corridors before rotating.
+                turn_clear_reward = -K_TURN_CLEAR * turn_start_clearance(traj)
 
                 return (score * 100000
                         + 100 * dist
                         + 10 * abs(self.last_param[0] - param[0])
                         + 10 * abs(self.last_param[1] - param[1])
-                        + reverse_gate_penalty)
+                        + reverse_gate_penalty
+                        + turn_clear_reward)
 
             top_k = 1
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
