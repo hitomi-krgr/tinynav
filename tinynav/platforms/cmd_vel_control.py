@@ -57,8 +57,7 @@ class CmdVelControlNode(Node):
         self.path_filter_tau = 0.30
         self.lookahead_steps = 1
         self.lookahead_distance = 0.8
-        self.yaw_kp = 0.4
-        self.yaw_p_ff_max = 0.4
+        self.yaw_kp = 0.4              # heading-drift correction gain
         self.yaw_kd = 0.0
         self._prev_heading_err = None
         # Static-friction compensation: very small vx often cannot move the robot.
@@ -66,12 +65,8 @@ class CmdVelControlNode(Node):
         self.min_effective_angular_speed = 0.1
         self.linear_engage_threshold = 0.04
         self.fixed_reverse_speed = 0.2
-        self.force_turn_heading_threshold = np.deg2rad(80.0)
-        self.rotate_first_heading_threshold = 0.45
-        self.rotate_first_gain = 1.6
 
         self.latest_cmd = Twist()
-        self.target_point_world = None
         self.path_vyaw_ff = 0.0
         self.is_backward_segment = False
         self.prev_cmd = Twist()
@@ -286,10 +281,8 @@ class CmdVelControlNode(Node):
         else:
             vx = float(np.clip(raw_vx, 0.0, 0.5))
 
-        # Store the world-frame lookahead target + path feedforward yaw. The closed-loop
-        # heading P term is applied in cmd_timer_callback against the live odometry pose,
-        # so per-device open-loop yaw drift is corrected continuously.
-        self.target_point_world = (T_robot_2[:3, 3]).copy()
+        # Feedforward yaw rate from the planned segment. The heading-drift P term is
+        # applied per-tick in cmd_timer_callback against the planned intended heading.
         self.is_backward_segment = is_backward_segment
         self.path_vyaw_ff = 0.0 if is_backward_segment else float(angular_velocity_vec[2])
         self.latest_cmd.linear.x = float(vx)

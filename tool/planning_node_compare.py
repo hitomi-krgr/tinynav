@@ -448,7 +448,6 @@ def reset_controller_state(ctrl):
     ctrl.path = None
     ctrl.latest_cmd = Twist()
     ctrl.prev_cmd = Twist()
-    ctrl.target_point_world = None
     ctrl.path_vyaw_ff = 0.0
     ctrl.is_backward_segment = False
     ctrl._prev_heading_err = None
