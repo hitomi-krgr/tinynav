@@ -22,7 +22,7 @@ from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_
 #  point sits in open space." Reward trajectories whose turn START (where yaw
 #  first deviates) lands at a high omni-ESDF cell.
 TURN_YAW_EPS = np.deg2rad(15.0)   # |yaw - yaw0| above this => "omega took effect"
-K_TURN_CLEAR = 0.0
+K_TURN_CLEAR = 40.0
 
 
 @dataclass
