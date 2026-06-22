@@ -21,7 +21,7 @@ trajectory on the map.
             tinynav/core/planning_node.py \
             tinynav/core/planning_node_turn.py \
             tinynav/core/planning_node_centerline.py \
-            --map tinynav_db/maps/<map_dir> --pois "home,boss,sit,printer,home"
+            --map tinynav_db/maps/<map_dir> --pois "home,printer"
 
 Plot lands in <out>/<route>.png (all nodes overlaid on the map).
 """
@@ -74,7 +74,7 @@ SPIN_DT = 0.02
 CTRL_DT = 1.0 / 12.0        # controller tick (matches cmd_rate_hz)
 PLAN_EVERY_TICKS = 3        # republish full sensor bundle (replan) every N ticks
 CMDVEL_MAX_T = 120.0        # sim-seconds budget per route
-TARGET_LOOKAHEAD_M = 2.0    # lookahead distance along the global path (map_node parity)
+TARGET_LOOKAHEAD_M = 2.5    # lookahead distance along the global path (map_node parity)
 
 
 def _precompute_rays():
@@ -421,6 +421,11 @@ def load_planning_node_class(path):
 # logic runs deterministically in sim time instead of wall-clock.
 SIM_CLOCK = [0.0]
 
+# Field-measured device open-loop yaw bias (rad/s), injected into the integrated
+# robot motion so the controller's online bias estimator (B) has something to learn.
+# 0 => ideal device. On the measured B2 the bias was ~0.05 rad/s.
+DEVICE_YAW_BIAS = float(os.environ.get("PNC_DEVICE_YAW_BIAS", "0.0"))
+
 
 def load_controller(path):
     spec = importlib.util.spec_from_file_location("cmdvel_ctrl", path)
@@ -450,7 +455,8 @@ def reset_controller_state(ctrl):
     ctrl.prev_cmd = Twist()
     ctrl.path_vyaw_ff = 0.0
     ctrl.is_backward_segment = False
-    ctrl._prev_heading_err = None
+    ctrl._yaw_bias_est = ctrl.yaw_bias_seed
+    ctrl._drift_lp = None
     ctrl.last_path_update_time = None
     ctrl.path_period_ema = 0.12
     ctrl.last_cmd_pub_time = 0.0
@@ -507,7 +513,8 @@ def run_route(node, ctrl, driver, executor, scene, fp):
         ctrl.cmd_timer_callback()
         executor.spin_once(timeout_sec=SPIN_DT)   # deliver /cmd_vel to the driver
         vx, wz = driver.latest_cmd
-        yaw += wz * CTRL_DT
+        # The real device rotates at commanded wz PLUS its intrinsic open-loop bias.
+        yaw += (wz + DEVICE_YAW_BIAS) * CTRL_DT
         cx += vx * np.cos(yaw) * CTRL_DT
         cy += vx * np.sin(yaw) * CTRL_DT
         samples.append((cx, cy))
@@ -535,6 +542,14 @@ def run_route(node, ctrl, driver, executor, scene, fp):
                   f"herr={herr} pathInWall={p_in}", flush=True)
 
     return {"traj": np.array(samples), "collided": collided}
+
+
+def lateral_deviation(traj, global_path):
+    """Max & final perpendicular distance [m] of the executed track from the
+    global-path polyline (nearest-vertex approximation)."""
+    gp = np.asarray(global_path)[:, :2]
+    d = np.array([np.min(np.linalg.norm(gp - p, axis=1)) for p in np.asarray(traj)[:, :2]])
+    return float(d.max()), float(d[-1])
 
 
 COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
@@ -630,6 +645,11 @@ def main():
                 ctrl.cam_forward_offset = CAM_FORWARD_OFFSET
                 ctrl.T_camera_to_control = ctrl.T_robot_to_camera.copy()
                 ctrl.T_camera_to_control[2, 3] = -CAM_FORWARD_OFFSET
+            # Sweep B's gains from the env without editing the deployment file.
+            if "PNC_YAW_BIAS_KI" in os.environ and hasattr(ctrl, "yaw_bias_ki"):
+                ctrl.yaw_bias_ki = float(os.environ["PNC_YAW_BIAS_KI"])
+            if "PNC_DRIFT_TAU" in os.environ and hasattr(ctrl, "drift_filter_tau"):
+                ctrl.drift_filter_tau = float(os.environ["PNC_DRIFT_TAU"])
             ctrl.cmd_timer.cancel()   # we tick it manually in sim time
             if fi == 0:
                 print(f"robot: {cfg.name} (cam_fwd_offset={CAM_FORWARD_OFFSET:.2f}, "
@@ -653,8 +673,12 @@ def main():
                 results[si][fi] = res
                 traj = res["traj"]
                 tag = " COLLIDED" if res["collided"] is not None else ""
+                mdev, fdev = lateral_deviation(traj, scene.global_path_pts)
+                bias = getattr(ctrl, "_yaw_bias_est", float("nan"))
                 print(f"  {scene.name}: {len(traj) - 1} steps, "
-                      f"end=({traj[-1, 0]:.2f},{traj[-1, 1]:.2f}){tag}", flush=True)
+                      f"end=({traj[-1, 0]:.2f},{traj[-1, 1]:.2f}) "
+                      f"maxdev={mdev:.3f}m enddev={fdev:.3f}m learned_bias={bias:+.4f}{tag}",
+                      flush=True)
 
             executor.remove_node(node)
             executor.remove_node(ctrl)
