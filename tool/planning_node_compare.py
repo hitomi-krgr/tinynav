@@ -428,6 +428,9 @@ DEVICE_YAW_BIAS = float(os.environ.get("PNC_DEVICE_YAW_BIAS", "0.0"))
 
 
 def load_controller(path):
+    # Disable the on-disk yaw-bias persistence so sim runs are deterministic and never
+    # load a stale calibration or write into the repo.
+    os.environ["TINYNAV_CMDVEL_CALIB"] = ""
     spec = importlib.util.spec_from_file_location("cmdvel_ctrl", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cmdvel_ctrl"] = mod
