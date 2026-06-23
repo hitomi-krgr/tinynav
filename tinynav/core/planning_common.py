@@ -352,34 +352,6 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
     return scores, occ_points
 
 
-def turn_start_clearance(traj, ESDF_map, origin, resolution, yaw_eps):
-    """ESDF at the point where the trajectory first turns (|yaw - yaw0| > yaw_eps);
-    endpoint clearance if it goes straight. ESDF is the omni-directional clearance,
-    so this rewards starting the turn in open space rather than inside a narrow
-    corridor."""
-    rows, cols = ESDF_map.shape
-
-    def yaw_at(row):
-        # body +Z is forward -> world heading from the pose rotation
-        R = quat_to_matrix(np.array([row[3], row[4], row[5], row[6]]))
-        fwd = R @ np.array([0.0, 0.0, 1.0])
-        return np.arctan2(fwd[1], fwd[0])
-
-    def esdf_at(xy):
-        ex = int((xy[0] - origin[0]) / resolution)
-        ey = int((xy[1] - origin[1]) / resolution)
-        if 0 <= ex < rows and 0 <= ey < cols:
-            return float(ESDF_map[ex, ey])
-        return 0.0
-
-    yaw0 = yaw_at(traj[0])
-    for i in range(len(traj)):
-        dyaw = np.arctan2(np.sin(yaw_at(traj[i]) - yaw0), np.cos(yaw_at(traj[i]) - yaw0))
-        if abs(dyaw) > yaw_eps:
-            return esdf_at(traj[i, :2])
-    return esdf_at(traj[-1, :2])
-
-
 def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
     shift_m = new_origin - old_origin
     shift_voxels = np.round(shift_m / resolution).astype(int)
