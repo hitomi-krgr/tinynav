@@ -51,7 +51,10 @@ class CmdVelControlNode(Node):
         self.path_stale_stop_factor = 5.0
         self.max_linear_acc = 0.6   # m/s^2
         self.max_angular_acc = 0.8  # rad/s^2
-        self.max_angular_speed = 0.8  # rad/s
+        # Match the planner's omega range (planning_common omega_y_samples = +/-pi/3);
+        # capping below it would clip the planner's sharp turns and widen their radius
+        # (the "tui tou" push-wide). The vx clip below likewise matches vx_max=0.5.
+        self.max_angular_speed = float(np.pi / 3)  # rad/s (~1.047), = planner omega max
         self.planner_dt = 0.1       # trajectory dt in planning_node
         # planning_node publishes path with for j in range(..., step=10), so points are ~1.0 s apart.
         self.path_pose_stride = 10
@@ -356,6 +359,14 @@ class CmdVelControlNode(Node):
             vx = -self.fixed_reverse_speed
         else:
             vx = float(np.clip(raw_vx, 0.0, 0.5))
+            # Preserve the planner's turn RADIUS when its omega exceeds the angular cap.
+            # The trajectory library samples |omega| up to pi/3 (~1.047 rad/s) but
+            # max_angular_speed caps at 0.8, so clipping omega alone widens the radius
+            # (= vx/omega) and the robot pushes wide on turns ("tui tou"). Scaling vx by
+            # the same ratio holds the radius the planner intended.
+            if abs(vyaw_seg) > self.max_angular_speed:
+                vx *= self.max_angular_speed / abs(vyaw_seg)
+                vyaw_seg = float(np.sign(vyaw_seg) * self.max_angular_speed)
 
         # Feedforward yaw rate from the planned segment. The heading-drift PI is applied
         # per-tick in cmd_timer_callback against the planned intended heading.
