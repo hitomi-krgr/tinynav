@@ -190,7 +190,9 @@ final planningStreamProvider = StreamProvider<PlanningState>((ref) {
         // Binary frame: first byte = kind, rest = payload.
         final frame = data is Uint8List ? data : Uint8List.fromList(data as List<int>);
         if (frame.isEmpty) return null;
-        final body = Uint8List.sublistView(frame, 1);
+        // Copy past the 1-byte tag: image codecs / Float32List decode from the
+        // backing buffer's offset 0, so a sublist *view* would include the tag.
+        final body = Uint8List.fromList(Uint8List.sublistView(frame, 1));
         switch (frame[0]) {
           case 0: // voxel cloud
             voxels = PlanningState.decodeVoxelBlob(body);
