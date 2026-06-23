@@ -417,7 +417,7 @@ class MapNode(Node):
                             curr_depth, _, curr_features, _, _ = self.nav_temp_db.get_depth_embedding_features_images(curr_timestamp)
                             prev_matched_keypoints, curr_matched_keypoints, matches = self.match_keypoints(prev_features, curr_features)
                             success, T_prev_curr, _, _, inliers = estimate_pose(prev_matched_keypoints, curr_matched_keypoints, curr_depth, self.K)
-                            if success and len(inliers) >= 100:
+                            if success and len(inliers) >= 50:
                                 self.relative_pose_constraint.append((curr_timestamp, prev_timestamp, T_prev_curr))
                                 #print(f"Added loop relative pose constraint: {curr_timestamp} -> {prev_timestamp}")
                     with Timer(name = "solve pose graph", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
