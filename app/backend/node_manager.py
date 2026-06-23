@@ -154,7 +154,7 @@ class BackendNode(Ros2NodeManager):
             PointCloud2, '/planning/occupied_voxels', self._on_occupied_voxels, 1
         )
         self.create_subscription(
-            String, '/insight/vio_status', self._on_vio_status, 10
+            String, '/camera/camera/vio_status', self._on_vio_status, 10
         )
 
         self._tf_buffer = tf2_ros.Buffer()
@@ -884,6 +884,7 @@ class BackendNode(Ros2NodeManager):
             'navActive': nav_active,
             'locAssistEnabled': loc_assist,
             'debugRecording': self.debug_recording,
+            'vioStatus': self.get_vio_status(),
         }
 
     @staticmethod
