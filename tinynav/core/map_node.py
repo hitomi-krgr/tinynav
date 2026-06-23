@@ -773,18 +773,6 @@ class MapNode(Node):
         sdf_start_path = search_close_to_sdf_map(start_idx, self.sdf_map, self.occupancy_map, 0.2)
         sdf_goal_path = search_close_to_sdf_map(poi_goal_idx, self.sdf_map, self.occupancy_map, 0.2)
 
-        # search_close_to_sdf_map returns [] when no free cell within stop_distance is
-        # reachable from start/goal (robot or POI sits in/against an obstacle). Treat it
-        # like an out-of-bounds index: bail with None instead of indexing [-1] and
-        # crashing the whole map_node process (which stalls nav -> nav_done never fires
-        # -> map handoff never triggers).
-        if len(sdf_start_path) == 0 or len(sdf_goal_path) == 0:
-            self.get_logger().warning(
-                f"search_close_to_sdf_map found no free cell: "
-                f"start_empty={len(sdf_start_path) == 0}, goal_empty={len(sdf_goal_path) == 0}"
-            )
-            return None
-
         sdf_start_sdf = sdf_start_path[-1]
         sdf_goal_sdf = sdf_goal_path[-1]
         path_sdf = search_within_sdf_map(sdf_start_sdf, sdf_goal_sdf, self.sdf_map, self.occupancy_map, resolution)
