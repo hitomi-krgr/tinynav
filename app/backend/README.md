@@ -83,7 +83,7 @@ The interactive API docs are available at `http://<host>:8000/docs`.
 | `/ws/pose` | On every odometry message | `{x, y, z, yaw, timestamp, source}` |
 | `/ws/map-update` | On map file change | `{event: "map_updated", timestamp}` |
 | `/ws/preview?topic=<topic>&quality=<default\|high>` | Up to 20 fps | Raw JPEG bytes for the selected camera topic; default is 320px/JPEG 50, high is 640px/JPEG 80 |
-| `/ws/planning` | ~5 fps | `{localized, odom_pose, map_pose, esdf_image, obstacle_image, trajectory, grid_info}` |
+| `/ws/planning` | ~5 fps | Text: `{localized, odom_pose, map_pose, trajectory, global_path, grid_info, footprint, ...}`. Plus tagged binary frames sent **only on change** — first byte = kind (`0`=voxel cloud as packed float32 xyz, `1`=ESDF JPEG, `2`=obstacle-mask PNG) |
 
 ### Sensor / camera
 

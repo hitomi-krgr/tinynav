@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 class VioStatus {
@@ -229,11 +228,6 @@ class PlanningState {
   });
 
   factory PlanningState.fromJson(Map<String, dynamic> j) {
-    Uint8List? decodeImg(String? b64) {
-      if (b64 == null || b64.isEmpty) return null;
-      return base64Decode(b64);
-    }
-
     Pose? parsePose(Object? raw) {
       if (raw == null) return null;
       return Pose.fromJson(raw as Map<String, dynamic>);
@@ -250,8 +244,6 @@ class PlanningState {
       odomPose: parsePose(j['odom_pose']),
       odomPoseAtKf: parsePose(j['odom_pose_at_kf']),
       mapPose: parsePose(j['map_pose']),
-      esdfImage: decodeImg(j['esdf_image'] as String?),
-      obstacleImage: decodeImg(j['obstacle_image'] as String?),
       trajectory: parsePath('trajectory'),
       globalPath: parsePath('global_path'),
       mapGlobalPath: parsePath('map_global_path'),
@@ -268,16 +260,46 @@ class PlanningState {
         final m = p as Map<String, dynamic>;
         return TrajPoint((m['x'] as num).toDouble(), (m['y'] as num).toDouble());
       }).toList(),
-      voxelPoints: (j['voxel_points'] as List? ?? []).map((p) {
-        final m = p as Map<String, dynamic>;
-        return VoxelPoint(
-          (m['x'] as num).toDouble(),
-          (m['y'] as num).toDouble(),
-          (m['z'] as num).toDouble(),
-        );
-      }).toList(),
     );
   }
+
+  /// Decode a packed little-endian float32 [x,y,z,...] voxel blob (pushed as a
+  /// separate binary WS frame, see /ws/planning).
+  static List<VoxelPoint> decodeVoxelBlob(Uint8List bytes) {
+    // Copy into a fresh buffer: the source is a view starting past the frame's
+    // tag byte, so its offset is not guaranteed 4-byte aligned for Float32List.
+    final aligned = Uint8List.fromList(bytes);
+    final floats = aligned.buffer.asFloat32List(0, aligned.lengthInBytes ~/ 4);
+    final out = <VoxelPoint>[];
+    for (var i = 0; i + 2 < floats.length; i += 3) {
+      out.add(VoxelPoint(floats[i], floats[i + 1], floats[i + 2]));
+    }
+    return out;
+  }
+
+  /// Merge in the "sticky" payloads streamed as separate binary frames
+  /// (voxel cloud, ESDF & obstacle images), which the provider retains across
+  /// JSON snapshots.
+  PlanningState withExtras({
+    Uint8List? esdfImage,
+    Uint8List? obstacleImage,
+    List<VoxelPoint>? voxelPoints,
+  }) =>
+      PlanningState(
+        localized: localized,
+        odomPose: odomPose,
+        odomPoseAtKf: odomPoseAtKf,
+        mapPose: mapPose,
+        esdfImage: esdfImage ?? this.esdfImage,
+        obstacleImage: obstacleImage ?? this.obstacleImage,
+        trajectory: trajectory,
+        globalPath: globalPath,
+        mapGlobalPath: mapGlobalPath,
+        gridInfo: gridInfo,
+        navTargetPose: navTargetPose,
+        footprint: footprint,
+        voxelPoints: voxelPoints ?? this.voxelPoints,
+      );
 }
 
 class SysInfo {

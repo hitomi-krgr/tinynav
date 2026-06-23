@@ -4,7 +4,8 @@ WebSocket endpoints:
   WS /ws/pose        — pushes pose whenever a new Odometry arrives
   WS /ws/map-update  — pushes a notification when map files change
   WS /ws/preview     — streams JPEG frames for a given image topic
-  WS /ws/planning    — polls planning snapshot at 5 fps
+  WS /ws/planning    — 5 fps JSON pose/path snapshot (text) + voxel/ESDF/obstacle
+                       payloads as tagged binary frames, sent only on change
   WS /ws/teleop      — receives cmd_vel commands from the client
 """
 from __future__ import annotations
@@ -19,6 +20,11 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from .state import runner
 
 router = APIRouter(tags=['ws'])
+
+# Binary-frame kinds pushed on /ws/planning (first byte of each binary frame).
+_TAG_VOXEL = 0
+_TAG_ESDF = 1
+_TAG_OBSTACLE = 2
 
 
 def _safe_put(queue: asyncio.Queue, item):
@@ -161,10 +167,24 @@ async def ws_planning(ws: WebSocket):
     if node is None:
         await ws.close(code=1013)
         return
+    # The big payloads (voxel cloud, ESDF/obstacle images) are pushed as tagged
+    # binary frames and only re-sent when they actually change — avoids
+    # re-streaming hundreds of KB of unchanged data 5x/s. First byte = kind.
+    last_seq = {_TAG_VOXEL: -1, _TAG_ESDF: -1, _TAG_OBSTACLE: -1}
+    getters = {
+        _TAG_VOXEL: node.get_voxel_blob,
+        _TAG_ESDF: node.get_esdf_blob,
+        _TAG_OBSTACLE: node.get_obstacle_blob,
+    }
     try:
         while True:
             payload = json.dumps(node.get_planning_snapshot())
             await ws.send_text(payload)
+            for tag, getter in getters.items():
+                seq, blob = getter()
+                if seq != last_seq[tag] and blob:
+                    last_seq[tag] = seq
+                    await ws.send_bytes(bytes([tag]) + blob)
             await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         pass
