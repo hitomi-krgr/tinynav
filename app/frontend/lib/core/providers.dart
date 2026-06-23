@@ -162,6 +162,11 @@ final previewStreamProvider =
 );
 
 /// Streams PlanningState from WS /ws/planning at ~5 fps.
+///
+/// The backend sends two frame kinds on this socket: a JSON text frame with the
+/// full planning snapshot (every tick), and a binary float32 voxel blob (only
+/// when the voxel cloud changes). We keep the latest voxels and merge them into
+/// each emitted PlanningState.
 final planningStreamProvider = StreamProvider<PlanningState>((ref) {
   final ip = ref.watch(deviceIpProvider);
   if (ip == null) return const Stream.empty();
@@ -169,9 +174,39 @@ final planningStreamProvider = StreamProvider<PlanningState>((ref) {
   final channel = WebSocketChannel.connect(Uri.parse('ws://$ip:8000/ws/planning'));
   ref.onDispose(() => channel.sink.close());
 
-  return channel.stream.map(
-    (data) => PlanningState.fromJson(jsonDecode(data as String) as Map<String, dynamic>),
-  );
+  // Sticky payloads streamed as tagged binary frames (see backend ws.py).
+  var voxels = const <VoxelPoint>[];
+  Uint8List? esdf;
+  Uint8List? obstacle;
+  PlanningState? last;
+
+  return channel.stream
+      .map<PlanningState?>((data) {
+        if (data is String) {
+          last = PlanningState.fromJson(jsonDecode(data) as Map<String, dynamic>)
+              .withExtras(esdfImage: esdf, obstacleImage: obstacle, voxelPoints: voxels);
+          return last;
+        }
+        // Binary frame: first byte = kind, rest = payload.
+        final frame = data is Uint8List ? data : Uint8List.fromList(data as List<int>);
+        if (frame.isEmpty) return null;
+        final body = Uint8List.sublistView(frame, 1);
+        switch (frame[0]) {
+          case 0: // voxel cloud
+            voxels = PlanningState.decodeVoxelBlob(body);
+            break;
+          case 1: // ESDF JPEG
+            esdf = body;
+            break;
+          case 2: // obstacle PNG
+            obstacle = body;
+            break;
+        }
+        last = last?.withExtras(esdfImage: esdf, obstacleImage: obstacle, voxelPoints: voxels);
+        return last;
+      })
+      .where((s) => s != null)
+      .cast<PlanningState>();
 });
 
 /// Streams VioStatus from WS /ws/vio-status (~1 s interval).

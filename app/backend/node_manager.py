@@ -18,7 +18,6 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-import base64
 
 import rclpy
 import rclpy.time
@@ -113,12 +112,15 @@ class BackendNode(Ros2NodeManager):
         self._odom_pose_at_kf: dict | None = None  # odom pose snapshotted at last mapPose update
         self._map_pose: dict | None = None
         self._localized: bool = False
-        self._esdf_bytes: bytes = b''
-        self._obstacle_bytes: bytes = b''
+        self._esdf_bytes: bytes = b''       # JPEG
+        self._esdf_seq: int = 0
+        self._obstacle_bytes: bytes = b''   # PNG (binary mask → lossless & smaller than JPEG)
+        self._obstacle_seq: int = 0
         self._trajectory: list = []
         self._global_path: list = []
         self._footprint: list = []   # 4 corner points [{x,y},...] in world frame
-        self._voxel_points: list = []
+        self._voxel_blob: bytes = b''  # packed little-endian float32 [x,y,z,...]
+        self._voxel_seq: int = 0       # bumped whenever _voxel_blob changes
         self._grid_info: dict | None = None
         self._nav_target_pose: dict | None = None
 
@@ -512,8 +514,11 @@ class BackendNode(Ros2NodeManager):
             # Invert JET colormap so dangerous (near obstacle) = red, safe = blue.
             arr = arr[:, :, ::-1]
             _, buf = cv2.imencode('.jpg', arr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            blob = buf.tobytes()
             with self._lock:
-                self._esdf_bytes = buf.tobytes()
+                if blob != self._esdf_bytes:
+                    self._esdf_bytes = blob
+                    self._esdf_seq += 1
         except Exception:
             pass
 
@@ -533,9 +538,12 @@ class BackendNode(Ros2NodeManager):
                 'width': int(msg.info.height),   # X_dim → image cols (horizontal)
                 'height': int(msg.info.width),   # Y_dim → image rows (vertical)
             }
+            blob = buf.tobytes()
             with self._lock:
-                self._obstacle_bytes = buf.tobytes()
                 self._grid_info = info
+                if blob != self._obstacle_bytes:
+                    self._obstacle_bytes = blob
+                    self._obstacle_seq += 1
         except Exception:
             pass
 
@@ -578,21 +586,43 @@ class BackendNode(Ros2NodeManager):
             self._footprint = corners
 
     def _on_occupied_voxels(self, msg: PointCloud2):
-        """Store a downsampled local 3D occupied voxel cloud for the web UI."""
+        """Store a downsampled local 3D occupied voxel cloud for the web UI.
+
+        Packed as little-endian float32 [x,y,z, x,y,z, ...] so it can be pushed
+        as a compact binary WS frame (~3x smaller than JSON floats) and only
+        re-sent when it actually changes (see _voxel_seq).
+        """
         try:
             step = max(1, len(msg.data) // max(1, msg.point_step) // 2500)
-            points = []
             import sensor_msgs_py.point_cloud2 as pc2
+            coords = []
             for i, p in enumerate(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)):
                 if i % step != 0:
                     continue
-                points.append({'x': float(p[0]), 'y': float(p[1]), 'z': float(p[2])})
-                if len(points) >= 2500:
+                coords.extend((float(p[0]), float(p[1]), float(p[2])))
+                if len(coords) >= 2500 * 3:
                     break
+            blob = np.asarray(coords, dtype='<f4').tobytes()
             with self._lock:
-                self._voxel_points = points
+                self._voxel_blob = blob
+                self._voxel_seq += 1
         except Exception:
             pass
+
+    def get_voxel_blob(self) -> tuple[int, bytes]:
+        """Return (seq, packed float32 xyz blob) of the latest voxel cloud."""
+        with self._lock:
+            return self._voxel_seq, self._voxel_blob
+
+    def get_esdf_blob(self) -> tuple[int, bytes]:
+        """Return (seq, JPEG bytes) of the latest ESDF / height-map image."""
+        with self._lock:
+            return self._esdf_seq, self._esdf_bytes
+
+    def get_obstacle_blob(self) -> tuple[int, bytes]:
+        """Return (seq, PNG bytes) of the latest obstacle mask image."""
+        with self._lock:
+            return self._obstacle_seq, self._obstacle_bytes
 
     def _on_vio_status(self, msg: String):
         with self._lock:
@@ -803,15 +833,12 @@ class BackendNode(Ros2NodeManager):
                 'odom_pose': self._odom_pose,
                 'odom_pose_at_kf': self._odom_pose_at_kf,
                 'map_pose': self._map_pose,
-                'esdf_image': base64.b64encode(self._esdf_bytes).decode() if self._esdf_bytes else None,
-                'obstacle_image': base64.b64encode(self._obstacle_bytes).decode() if self._obstacle_bytes else None,
                 'trajectory': list(self._trajectory),
                 'global_path': None,  # filled after TF transform (odom frame)
                 'map_global_path': path_snapshot,
                 'grid_info': self._grid_info,
                 'nav_target_pose': self._nav_target_pose,
                 'footprint': list(self._footprint),
-                'voxel_points': list(self._voxel_points),
             }
         snapshot['global_path'] = self._transform_path_via_tf(path_snapshot)
         return snapshot
