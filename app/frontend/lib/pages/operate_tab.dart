@@ -1549,6 +1549,13 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
 
   BoxFit get _previewFit => _previewCover ? BoxFit.cover : BoxFit.contain;
 
+  String _vioStatusText(WidgetRef ref) {
+    final fromWs = ref.watch(vioStatusProvider).valueOrNull?.data ?? '';
+    final fromStatus = ref.watch(deviceStatusProvider).valueOrNull?.vioStatus ?? '';
+    final text = fromWs.isNotEmpty ? fromWs : fromStatus;
+    return text.isNotEmpty ? text : '等待 VIO…';
+  }
+
   void _showFullscreen(BuildContext context) {
     final topic = ref.read(selectedPreviewTopicProvider);
     if (topic == null) return;
@@ -1566,6 +1573,7 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
   @override
   Widget build(BuildContext context) {
     final topicsAsync = ref.watch(imageTopicsProvider);
+    final sensorMode = ref.watch(sensorModeProvider).valueOrNull;
     final selectedTopic = ref.watch(selectedPreviewTopicProvider);
     final previewQuality = ref.watch(previewQualityProvider);
     final topics = topicsAsync.valueOrNull ?? [];
@@ -1633,11 +1641,13 @@ class _CameraPanelState extends ConsumerState<_CameraPanel> {
                 baseUrl: baseUrl,
               ),
             ),
-          // ── VIO Status ─────────────────────────────────────────────
-          if (ref.watch(vioStatusProvider).valueOrNull?.data.isNotEmpty ?? false)
+          // ── VIO Status (looper / insight_full only) ────────────────
+          if (sensorMode == 'looper')
             Positioned(
               bottom: 8, left: 8,
-              child: _VioStatusChip(status: ref.watch(vioStatusProvider).valueOrNull!),
+              child: _VioStatusChip(
+                text: _vioStatusText(ref),
+              ),
             ),
           // ── Topic selector ───────────────────────────────────────────
           Positioned(
@@ -1846,9 +1856,11 @@ class _MapPip extends StatelessWidget {
 // ── VIO status chip ──────────────────────────────────────────────────────────
 
 class _VioStatusChip extends StatelessWidget {
-  final VioStatus status;
+  final String text;
 
-  const _VioStatusChip({required this.status});
+  const _VioStatusChip({required this.text});
+
+  bool get _waiting => text == '等待 VIO…';
 
   @override
   Widget build(BuildContext context) {
@@ -1864,13 +1876,20 @@ class _VioStatusChip extends StatelessWidget {
         children: [
           Container(
             width: 7, height: 7,
-            decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.cyanAccent),
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _waiting ? Colors.white38 : Colors.cyanAccent,
+            ),
           ),
           const SizedBox(width: 6),
           Flexible(
             child: Text(
-              status.data,
-              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w500),
+              text,
+              style: TextStyle(
+                color: _waiting ? Colors.white54 : Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+              ),
               overflow: TextOverflow.ellipsis,
               maxLines: 1,
             ),

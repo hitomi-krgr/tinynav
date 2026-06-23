@@ -358,11 +358,9 @@ class MapNode(Node):
         image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
 
         keyframe_image_timestamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
-        if not self.relocalized_once:
-            success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
-            if success:
-                self.relocalized_once = True
-                self.compute_transform_from_map_to_odom()
+        success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
+        if success:
+            self.compute_transform_from_map_to_odom()
 
         with Timer(name = "nav path", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             self.try_publish_nav_path(keyframe_image_timestamp_ns)
