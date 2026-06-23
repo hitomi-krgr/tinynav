@@ -165,12 +165,18 @@ class ObstacleConfig:
     robot_z_top: float = 0.3
     occ_threshold: float = 0.1
     min_wall_span_m: float = 0.2
+    ground_band_m: float = 0.3
+    floating_min_span_m: float = 0.05
     dilation_cells: int = 0
 
 
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
     """Obstacle = cells where occupied voxels span >= min_wall_span_m in z.
-    Walls have large z-span; stair risers / ground bumps have small span."""
+    The span filter only applies to cells whose lowest occupied voxel sits near
+    the ground (within ground_band_m of robot_z_bottom): walls have large z-span
+    while stair risers / ground bumps have small span. Cells whose occupancy
+    starts above that ground band (floating / mid-height obstacles) are always
+    treated as obstacles regardless of span."""
     config = config or ObstacleConfig()
     h, w, z_dim = occupancy_grid.shape
     z_world = origin[2] + (np.arange(z_dim) + 0.5) * resolution
@@ -182,11 +188,20 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
         band_occ = occupancy_grid[:, :, z_mask] > config.occ_threshold
         has_occ = np.any(band_occ, axis=2)
         n_z = band_occ.shape[2]
+        z_rel_band = z_rel[z_mask]
         z_idx = np.arange(n_z, dtype=np.float32)
         occ_high = np.where(band_occ, z_idx[np.newaxis, np.newaxis, :], -1).max(axis=2)
         occ_low = np.where(band_occ, z_idx[np.newaxis, np.newaxis, :], n_z).min(axis=2)
         z_span = (occ_high - occ_low) * resolution
-        obstacle = has_occ & (z_span >= config.min_wall_span_m)
+        # relative height of the lowest occupied voxel in each cell
+        low_z_rel = z_rel_band[np.clip(occ_low, 0, n_z - 1).astype(np.int64)]
+        near_ground = low_z_rel <= config.robot_z_bottom + config.ground_band_m
+        # ground-anchored cells: full span filter (wall vs stair/bump);
+        # floating cells: small span filter just to reject single-voxel noise
+        span_ok = np.where(near_ground,
+                           z_span >= config.min_wall_span_m,
+                           z_span >= config.floating_min_span_m)
+        obstacle = has_occ & span_ok
 
     if config.dilation_cells > 0 and np.any(obstacle):
         obstacle = binary_dilation(obstacle, iterations=config.dilation_cells)
