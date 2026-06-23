@@ -9,6 +9,8 @@ from scipy.spatial.transform import Rotation as R
 import numpy as np
 import logging
 import time
+import os
+import json
 
 # Module-level logger for cases where self.get_logger() is not available
 logger = logging.getLogger(__name__)
@@ -81,6 +83,16 @@ class CmdVelControlNode(Node):
         self.straight_ff_threshold = 0.05  # rad/s; |feedforward| below this == straight
         self._yaw_bias_est = self.yaw_bias_seed  # learned bias / integral state (rad/s)
         self._drift_lp = None          # low-passed drift state
+        # Persist the self-learned bias across runs: load it as the seed on start, save
+        # periodically + on shutdown. Removes the per-device cold-start drift with no
+        # hand-entered yaw_bias_seed. Set env TINYNAV_CMDVEL_CALIB="" to disable (sim /
+        # regression), or to another path to relocate it. Default matches the repo's
+        # runtime scratch dir (map_node's --tinynav_db_path default).
+        self.calib_path = os.environ.get("TINYNAV_CMDVEL_CALIB",
+                                         os.path.join("tinynav_temp", "cmd_vel_calib.json"))
+        self.calib_save_period_s = 10.0
+        self._last_calib_save = time.monotonic()
+        self._load_calib()
         # Static-friction compensation: very small vx often cannot move the robot.
         self.min_effective_linear_speed = 0.1
         # Yaw deadzone. Must stay BELOW the per-device yaw bias we need to cancel,
@@ -124,6 +136,38 @@ class CmdVelControlNode(Node):
             # Send one stop when navigation is deactivated, then stay silent so
             # manual teleop can own /cmd_vel without being overwritten by zeros.
             self.cmd_pub.publish(Twist())
+
+    def _load_calib(self):
+        """Seed the bias estimator from the last persisted value, if any."""
+        if not self.calib_path:
+            return
+        try:
+            with open(self.calib_path) as f:
+                val = float(json.load(f)["yaw_bias"])
+            self._yaw_bias_est = float(np.clip(val, -self.yaw_bias_limit, self.yaw_bias_limit))
+            self.logger.info(
+                f"Loaded yaw-bias calibration {self._yaw_bias_est:+.4f} rad/s from {self.calib_path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.logger.warning(f"Could not load yaw-bias calibration ({self.calib_path}): {e}")
+
+    def _save_calib(self, force=False):
+        """Persist the learned bias (throttled, atomic)."""
+        if not self.calib_path:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_calib_save) < self.calib_save_period_s:
+            return
+        self._last_calib_save = now
+        try:
+            os.makedirs(os.path.dirname(self.calib_path) or ".", exist_ok=True)
+            tmp = self.calib_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"yaw_bias": float(self._yaw_bias_est)}, f)
+            os.replace(tmp, self.calib_path)
+        except Exception as e:
+            self.logger.warning(f"Could not save yaw-bias calibration ({self.calib_path}): {e}")
 
     def pose_callback(self, msg):
         self.pose = msg
@@ -209,6 +253,7 @@ class CmdVelControlNode(Node):
                 self._yaw_bias_est += self.yaw_bias_ki * self._drift_lp * dt
                 self._yaw_bias_est = float(np.clip(self._yaw_bias_est,
                                                    -self.yaw_bias_limit, self.yaw_bias_limit))
+                self._save_calib()   # throttled; persists the live estimate
             vyaw = self.path_vyaw_ff - (self.yaw_kp * self._drift_lp + self._yaw_bias_est)
         else:
             # No path/pose yet: feedforward minus the bias learned so far.
@@ -326,6 +371,7 @@ class CmdVelControlNode(Node):
         )
 
     def destroy_node(self):
+        self._save_calib(force=True)
         self.logger.info("Destroying cmd_vel_control connection.")
         super().destroy_node()
         
