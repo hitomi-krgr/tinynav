@@ -1571,6 +1571,19 @@ class BackendNode(Ros2NodeManager):
         Items may be integer POI IDs or POI names. The payload is re-indexed as
         a dense queue while preserving each POI's original id/name metadata.
         """
+        # Re-arm this map's outbound handoffs. _handled_map_handoffs dedups a
+        # (map, poi) handoff so it fires once per arrival instead of on every
+        # percent=100 nav_progress tick while parked at the POI. But it was never
+        # cleared, so on a repeated tour / loop the second pass through a map found
+        # its key already set and silently skipped the handoff. Sending a fresh POI
+        # queue means we are (re)entering this map, so drop its keys and let its
+        # handoffs trigger again.
+        active_map = self._active_map_name()
+        if active_map:
+            with self._lock:
+                self._handled_map_handoffs = {
+                    k for k in self._handled_map_handoffs if k[0] != active_map
+                }
         if not poi_ids:
             self._cmd_pois_pub.publish(String(data='{}'))
             self._set_nav_active(False)
