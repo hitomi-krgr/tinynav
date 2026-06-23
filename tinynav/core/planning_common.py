@@ -175,8 +175,9 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
     The span filter only applies to cells whose lowest occupied voxel sits near
     the ground (within ground_band_m of robot_z_bottom): walls have large z-span
     while stair risers / ground bumps have small span. Cells whose occupancy
-    starts above that ground band (floating / mid-height obstacles) are always
-    treated as obstacles regardless of span."""
+    starts above that ground band (floating / mid-height obstacles) use a much
+    smaller span threshold (floating_min_span_m) just to reject single-voxel
+    noise, so real low-profile obstacles are still kept."""
     config = config or ObstacleConfig()
     h, w, z_dim = occupancy_grid.shape
     z_world = origin[2] + (np.arange(z_dim) + 0.5) * resolution
