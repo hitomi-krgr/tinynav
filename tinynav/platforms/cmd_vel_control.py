@@ -305,7 +305,7 @@ class CmdVelControlNode(Node):
         if is_backward_segment:
             vx = -self.fixed_reverse_speed
         else:
-            vx = float(np.clip(raw_vx, 0.0, 0.3))
+            vx = float(np.clip(raw_vx, 0.0, 0.4))
             # Preserve turn radius (vx/omega) when omega exceeds the cap: scale vx by the
             # same ratio instead of just clipping omega (which would widen the radius).
             if abs(vyaw_seg) > self.max_angular_speed:
