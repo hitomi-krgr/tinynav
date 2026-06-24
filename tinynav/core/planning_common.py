@@ -71,7 +71,7 @@ B2_CONFIG = RobotConfig(
     length=0.8, width=0.3,
     camera_x=0.5, camera_y=0.0,
     control_x=0.0, control_y=0.0,
-    safety_radius=0.12,
+    safety_radius=0.1,
 )
 
 
