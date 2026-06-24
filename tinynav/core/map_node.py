@@ -200,6 +200,7 @@ class MapNode(Node):
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
         self.pois_sub = self.create_subscription(String, '/mapping/cmd_pois', self.pois_callback, 10)
+        self.vio_status_sub = self.create_subscription(String, '/slam/vio_status', self.vio_status_callback, 10)
 
         # pubs
         self.pose_graph_trajectory_pub = self.create_publisher(Path, "/mapping/pose_graph_trajectory", 10)
@@ -252,10 +253,24 @@ class MapNode(Node):
         # if the observed T_from_map_to_odom is consistent with the recent
         # consecutive observations. This rejects isolated wrong-DINO picks while
         # still re-acquiring after a genuine, sustained shift (e.g. VIO restart).
-        self.reloc_debounce_window = 5          # require this many consecutive consistent observations
-        self.reloc_debounce_trans_thresh = 2.5  # meters
-        self.reloc_debounce_rot_thresh = np.deg2rad(60.0)  # radians
-        self.reloc_pending = collections.deque(maxlen=self.reloc_debounce_window)
+        self.reloc_debounce_window_sec = 3.0    # observations within this trailing time window must agree
+        self.reloc_debounce_trans_thresh = 2.5  # meters, max distance from the window's geometric center
+        self.reloc_pending = collections.deque()  # (timestamp_ns, observed map->odom translation), time-pruned
+        self.reloc_window_start_ts = None         # ts of the first observation since (re)start, for warmup gating
+
+        # VIO restart handling: when the VIO drops out of tracking the odom frame
+        # is invalidated/redefined, so all accumulated relocalization observations
+        # become stale. Watch /slam/vio_status and reset the relocalization state
+        # on the tracking -> non-tracking edge. TRACKING <-> TRACKING_STATIC is a
+        # normal moving/standing-still switch and does NOT count as a dropout.
+        self.vio_tracking_states = {"TRACKING", "TRACKING_STATIC"}
+        self.vio_was_tracking = False
+
+        # Robust (Huber) IRLS for the map->odom solve: the debounce gate rejects
+        # gross wrong-DINO outliers, this down-weights the medium ones that slip
+        # through so a single off observation can't drag T_from_map_to_odom.
+        self.reloc_irls_iterations = 3      # re-weight / re-solve rounds
+        self.reloc_huber_delta = 0.3        # meters; residuals beyond this are down-weighted ~delta/r
 
         self.T_from_map_to_odom = None
 
@@ -342,6 +357,24 @@ class MapNode(Node):
 
     def continuous_odom_callback(self, odom_msg: Odometry):
         self.continuous_odom_recorder.record_odometry_msg(odom_msg)
+
+    def vio_status_callback(self, msg: String):
+        tracking_now = msg.data in self.vio_tracking_states
+        # tracking -> non-tracking edge: the VIO is restarting / lost, so the odom
+        # frame is about to be (or already) redefined. Drop all stale relocalization
+        # state; it re-acquires from scratch once tracking + relocalization resume.
+        if self.vio_was_tracking and not tracking_now:
+            self.get_logger().warning(
+                f"[vio] tracking dropped to '{msg.data}', resetting relocalization state")
+            self.reset_relocalization_state()
+        self.vio_was_tracking = tracking_now
+
+    def reset_relocalization_state(self):
+        self.relocalization_poses = {}
+        self.relocalization_pose_weights = {}
+        self.reloc_pending.clear()
+        self.reloc_window_start_ts = None
+        self.T_from_map_to_odom = None
 
     def localization_stop_callback(self, msg: Bool):
         if msg.data:
@@ -566,15 +599,21 @@ class MapNode(Node):
 
     def accept_relocalization(self, timestamp_ns: int, pose_in_world: np.ndarray) -> bool:
         """
-        Sliding-window debounce on the observed map->odom transform.
+        Time-windowed debounce on the observed map->odom transform.
 
         Each successful PnP implies an observation of T_from_map_to_odom:
             T = camera_in_odom_world @ inv(camera_in_map_world)
-        For correct relocalizations this transform is stable; a wrong-DINO pick
-        produces an outlier. We only accept an observation once the last
-        `reloc_debounce_window` consecutive observations agree within thresholds.
-        A genuine sustained shift (e.g. VIO restart) re-acquires naturally once
-        enough new-range observations accumulate.
+        For correct relocalizations the translation of this transform is stable;
+        a wrong-DINO pick produces an outlier. We keep every observation from the
+        trailing `reloc_debounce_window_sec` seconds and accept the new one only if
+        the window already spans that full duration AND every observation in it
+        lies within `reloc_debounce_trans_thresh` of the window's geometric center.
+
+        Distance is measured against the geometric center (mean) of the window, not
+        the first point, so the threshold is symmetric about the cluster. Rotation
+        is not checked (max vx 0.3, ~5 s trajectory makes translation sufficient).
+        A genuine sustained shift (e.g. VIO restart) re-acquires once the stale
+        observations age out of the window.
 
         Returns True if the observation should be committed.
         """
@@ -585,36 +624,44 @@ class MapNode(Node):
 
         camera_in_odom_world = self.pose_graph_used_pose[timestamp_ns]
         observed_T = camera_in_odom_world @ np.linalg.inv(pose_in_world)
-        self.reloc_pending.append(observed_T)
+        self.reloc_pending.append((timestamp_ns, observed_T[:3, 3].copy()))
+        if self.reloc_window_start_ts is None:
+            self.reloc_window_start_ts = timestamp_ns
 
-        if len(self.reloc_pending) < self.reloc_debounce_window:
+        # Drop observations older than the trailing time window.
+        window_ns = self.reloc_debounce_window_sec * 1e9
+        while self.reloc_pending and (timestamp_ns - self.reloc_pending[0][0]) > window_ns:
+            self.reloc_pending.popleft()
+
+        # Warm up by wall time since the first observation, NOT by the pruned
+        # window span (pruning caps the span just under window_sec, so it could
+        # never reach it and would block acceptance forever). During warmup we
+        # provisionally accept single frames so T_from_map_to_odom comes up
+        # immediately instead of after a 3 s blackout; the strict geometric-center
+        # gate only kicks in once the window is full.
+        elapsed_sec = (timestamp_ns - self.reloc_window_start_ts) / 1e9
+        if elapsed_sec < self.reloc_debounce_window_sec:
             self.get_logger().info(
-                f"[reloc-debounce] ts={timestamp_ns} warming up window "
-                f"{len(self.reloc_pending)}/{self.reloc_debounce_window}, holding")
-            return False
+                f"[reloc-debounce] ts={timestamp_ns} warming up, {elapsed_sec:.2f}s "
+                f"< {self.reloc_debounce_window_sec}s since first obs ({len(self.reloc_pending)} obs), "
+                f"provisionally accepting")
+            return True
 
-        ref = self.reloc_pending[-1]
-        ref_inv = np.linalg.inv(ref)
-        max_trans_diff = 0.0
-        max_rot_diff = 0.0
-        for other in list(self.reloc_pending)[:-1]:
-            delta = ref_inv @ other
-            trans_diff = np.linalg.norm(delta[:3, 3])
-            cos_angle = (np.trace(delta[:3, :3]) - 1.0) / 2.0
-            rot_diff = np.arccos(np.clip(cos_angle, -1.0, 1.0))
-            max_trans_diff = max(max_trans_diff, trans_diff)
-            max_rot_diff = max(max_rot_diff, rot_diff)
+        window_span_sec = (timestamp_ns - self.reloc_pending[0][0]) / 1e9
+        translations = np.array([t for _, t in self.reloc_pending])
+        center = translations.mean(axis=0)
+        max_dist = np.linalg.norm(translations - center, axis=1).max()
 
-        if max_trans_diff > self.reloc_debounce_trans_thresh or max_rot_diff > self.reloc_debounce_rot_thresh:
+        if max_dist > self.reloc_debounce_trans_thresh:
             self.get_logger().warning(
-                f"[reloc-debounce] ts={timestamp_ns} REJECTED, inconsistent map->odom: "
-                f"max_trans_diff={max_trans_diff:.3f}m (thr {self.reloc_debounce_trans_thresh}m), "
-                f"max_rot_diff={np.rad2deg(max_rot_diff):.1f}deg (thr {np.rad2deg(self.reloc_debounce_rot_thresh):.1f}deg)")
+                f"[reloc-debounce] ts={timestamp_ns} REJECTED, max dist from center "
+                f"{max_dist:.3f}m > {self.reloc_debounce_trans_thresh}m "
+                f"({len(self.reloc_pending)} obs over {window_span_sec:.2f}s)")
             return False
 
         self.get_logger().info(
-            f"[reloc-debounce] ts={timestamp_ns} ACCEPTED, "
-            f"max_trans_diff={max_trans_diff:.3f}m, max_rot_diff={np.rad2deg(max_rot_diff):.1f}deg")
+            f"[reloc-debounce] ts={timestamp_ns} ACCEPTED, max dist from center "
+            f"{max_dist:.3f}m ({len(self.reloc_pending)} obs over {window_span_sec:.2f}s)")
         return True
 
     def save_relocalization_poses(self):
@@ -652,25 +699,57 @@ class MapNode(Node):
 
     def compute_transform_from_map_to_odom(self):
         """
-        Solve the optmization problem.
+        Solve for T_from_map_to_odom from the relocalization observations.
+
+        Each observation is a noisy measurement of the (near-constant) map->odom
+        transform. We solve it robustly with Huber IRLS: pose_graph_solve is the
+        inner weighted-least-squares step, and between rounds each observation's
+        base weight is scaled by a Huber factor (1 if its translation residual
+        against the current estimate is within reloc_huber_delta, else ~delta/r).
+        This down-weights medium outliers that pass the debounce gate instead of
+        letting them pull the estimate.
         """
-        relative_pose_constraint = []
-        optimized_parameters = {
-            0 : np.eye(4) if self.T_from_map_to_odom is None else self.T_from_map_to_odom,
-            1 : np.eye(4),
-        }
-        constant_pose_index_dict = { 1: True }
+        # Collect the (observation, base_weight) pairs, most recent 100.
+        observations = []
         for timestamp, pose in self.relocalization_poses.items():
             if timestamp in self.pose_graph_used_pose:
                 camera_in_map_world = pose
                 camera_in_odom_world = self.pose_graph_used_pose[timestamp]
-                observation_T_from_map_to_odom =  camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
-                weight = self.relocalization_pose_weights[timestamp]
+                observation_T_from_map_to_odom = camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
+                base_weight = self.relocalization_pose_weights[timestamp]
+                observations.append((observation_T_from_map_to_odom, base_weight))
+        observations = observations[-100:]
+        if len(observations) == 0:
+            return
 
-                relative_pose_constraint.append((0, 1, observation_T_from_map_to_odom, weight * np.array([10.0, 10.0, 10.0]), weight * np.array([10.0, 10.0, 10.0])))
-        relative_pose_constraint = relative_pose_constraint[-100:]
-        optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
-        self.T_from_map_to_odom = optimized_parameters[0]
+        T_estimate = np.eye(4) if self.T_from_map_to_odom is None else self.T_from_map_to_odom
+        constant_pose_index_dict = {1: True}
+        for iteration in range(self.reloc_irls_iterations):
+            relative_pose_constraint = []
+            num_downweighted = 0
+            for observation_T, base_weight in observations:
+                # Translation residual of this observation against the current estimate.
+                residual = np.linalg.norm((np.linalg.inv(T_estimate) @ observation_T)[:3, 3])
+                if residual <= self.reloc_huber_delta:
+                    robust = 1.0
+                else:
+                    robust = self.reloc_huber_delta / residual
+                    num_downweighted += 1
+                w = base_weight * robust * np.array([10.0, 10.0, 10.0])
+                relative_pose_constraint.append((0, 1, observation_T, w, w))
+
+            optimized_parameters = pose_graph_solve(
+                {0: T_estimate, 1: np.eye(4)},
+                relative_pose_constraint,
+                constant_pose_index_dict,
+                max_iteration_num=1000,
+            )
+            T_estimate = optimized_parameters[0]
+            self.get_logger().info(
+                f"[reloc-irls] iter {iteration + 1}/{self.reloc_irls_iterations}, "
+                f"{num_downweighted}/{len(observations)} obs down-weighted (delta={self.reloc_huber_delta}m)")
+
+        self.T_from_map_to_odom = T_estimate
 
     def try_publish_nav_path(self, timestamp: int):
         self.get_logger().info(f"try_publish_nav_path, timestamp: {timestamp}")
