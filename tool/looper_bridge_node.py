@@ -9,6 +9,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from std_msgs.msg import String
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -48,6 +49,9 @@ class LooperBridgeNode(Node):
         self.vio_100hz_sub = self.create_subscription(
             PoseStamped, "/camera/camera/vio_100hz", self.vio_100hz_callback, 50
         )
+        self.vio_status_sub = self.create_subscription(
+            String, "/camera/camera/vio_status", self.vio_status_callback, 10
+        )
 
         self.depth_sub = message_filters.Subscriber(self, Image, "/camera/camera/depth/image_rect_raw", qos_profile=self.sensor_qos)
         self.pose_sub = message_filters.Subscriber(self, PoseStamped, "/camera/camera/vio_20hz")
@@ -72,6 +76,7 @@ class LooperBridgeNode(Node):
         )
         self.keyframe_image_pub = self.create_publisher(Image, "/slam/keyframe_image", 10)
         self.keyframe_depth_pub = self.create_publisher(Image, "/slam/keyframe_depth", 10)
+        self.vio_status_pub = self.create_publisher(String, "/slam/vio_status", 10)
 
         self.get_logger().info(
             "Bridging /camera/camera/vio_20hz + /camera/camera/depth/image_rect_raw + /camera/camera/infra1/image_rect_raw into TinyNav /slam topics."
@@ -88,6 +93,16 @@ class LooperBridgeNode(Node):
         self.get_logger().info(
             f"Bridged first /camera/camera/vio_100hz message at "
             f"{pose_msg.header.stamp.sec}.{pose_msg.header.stamp.nanosec:09d} to /slam/odometry.",
+            once=True,
+        )
+
+    def vio_status_callback(self, msg: String):
+        # Relay the VIO manager status (NOT_INITED / RESTARTING / STOPPED /
+        # TRACKING / TRACKING_STATIC / TRACKING_LOST / DATA_LOST) so downstream
+        # SLAM nodes can react to VIO restarts without touching camera topics.
+        self.vio_status_pub.publish(msg)
+        self.get_logger().info(
+            f"Bridged first /camera/camera/vio_status ('{msg.data}') to /slam/vio_status.",
             once=True,
         )
 
