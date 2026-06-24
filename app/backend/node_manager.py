@@ -212,6 +212,11 @@ class BackendNode(Ros2NodeManager):
         self._loc_assist_enabled: bool = False
         self._loc_assist_thread: threading.Thread | None = None
         self._loc_assist_stop_event = threading.Event()
+        # Optional one-shot preset deflection (degrees, +CCW) applied before the
+        # sweep starts, set per map-handoff rule from nav_flow.json. The sweep
+        # turns to this heading first, then begins the expanding scan from there.
+        # Consumed (reset to 0) when the assist loop picks it up.
+        self._loc_assist_initial_yaw_deg: float = 0.0
 
         self._nav_progress: dict | None = None
         self.nav_progress_callbacks: list = []
@@ -396,7 +401,19 @@ class BackendNode(Ros2NodeManager):
         if not isinstance(poi_list, list) or not all(isinstance(p, (int, str)) for p in poi_list):
             self.get_logger().error(f'Invalid map handoff poi_list: {poi_list!r}')
             return None
-        return {'target_map': target_map, 'poi_list': poi_list}
+        # Optional preset deflection applied before the localization-assist sweep
+        # (degrees, +CCW). Accept a few aliases; default 0 (sweep starts in place).
+        initial_yaw_deg = (
+            rule.get('initial_yaw_deg')
+            if rule.get('initial_yaw_deg') is not None
+            else rule.get('loc_assist_yaw_deg', 0.0)
+        )
+        try:
+            initial_yaw_deg = float(initial_yaw_deg)
+        except (TypeError, ValueError):
+            self.get_logger().error(f'Invalid map handoff initial_yaw_deg: {initial_yaw_deg!r}')
+            initial_yaw_deg = 0.0
+        return {'target_map': target_map, 'poi_list': poi_list, 'initial_yaw_deg': initial_yaw_deg}
 
     def _set_active_map_link(self, map_name: str):
         import shutil
@@ -431,6 +448,8 @@ class BackendNode(Ros2NodeManager):
                 self._global_path = []
                 self._nav_target_pose = None
                 self._nav_progress = None
+                # One-shot preset deflection for this handoff's assist sweep.
+                self._loc_assist_initial_yaw_deg = float(rule.get('initial_yaw_deg', 0.0))
 
             self.cmd_start_nav_nodes()
 
@@ -1162,7 +1181,26 @@ class BackendNode(Ros2NodeManager):
         step_rad = math.radians(step_deg)
         stop = self._loc_assist_stop_event
 
-        # Dwell at initial position
+        # Consume the one-shot preset deflection (set per map-handoff rule). Turn
+        # to it first so the expanding sweep is centered on the configured heading
+        # rather than wherever the robot happened to stop. Manual (non-handoff)
+        # assist runs leave this at 0 and behave as before.
+        with self._lock:
+            initial_yaw_deg = self._loc_assist_initial_yaw_deg
+            self._loc_assist_initial_yaw_deg = 0.0
+        if abs(initial_yaw_deg) > 1e-3:
+            self.get_logger().info(
+                f'Localization assist: turning to preset {initial_yaw_deg:.1f}° before sweep')
+            if self._turn_relative_by_odom(
+                target_delta=math.radians(initial_yaw_deg),
+                angular_speed=angular_speed,
+                cmd_rate_hz=cmd_rate_hz,
+                yaw_tolerance=yaw_tolerance,
+                stop=stop,
+            ):
+                return
+
+        # Dwell at initial position (now the preset heading, if any)
         if self._wait_or_localized(dwell_s, stop):
             return
 
