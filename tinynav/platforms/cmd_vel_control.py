@@ -46,7 +46,7 @@ class CmdVelControlNode(Node):
         self.max_linear_acc = 0.6   # m/s^2
         self.max_angular_acc = 0.8  # rad/s^2
         # Match the planner's omega range; capping below it widens turn radius.
-        self.max_angular_speed = float(np.pi / 2)  # rad/s, = planner omega max
+        self.max_angular_speed = float(np.pi / 3)  # rad/s, = planner omega max
         self.planner_dt = 0.1       # trajectory dt in planning_node
         self.path_pose_stride = 10  # planning_node publishes every 10th point (~1.0 s)
         self.path_period_ema = 0.12
