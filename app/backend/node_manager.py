@@ -125,6 +125,11 @@ class BackendNode(Ros2NodeManager):
         self._nav_target_pose: dict | None = None
 
         self._vio_status: str = ''
+        # Mirror of map_node's VIO drop detection: on the tracking -> non-tracking
+        # edge the odom frame is invalidated and map_node resets its relocalization
+        # state, so the app is no longer localized until reacquisition completes.
+        self._vio_tracking_states = {'TRACKING', 'TRACKING_STATIC'}
+        self._vio_was_tracking = False
 
         # Debug recording (independent of main state machine)
         self._debug_record_proc: subprocess.Popen | None = None
@@ -625,8 +630,19 @@ class BackendNode(Ros2NodeManager):
             return self._obstacle_seq, self._obstacle_bytes
 
     def _on_vio_status(self, msg: String):
+        tracking_now = msg.data in self._vio_tracking_states
         with self._lock:
             self._vio_status = msg.data
+            dropped = self._vio_was_tracking and not tracking_now
+            self._vio_was_tracking = tracking_now
+            if dropped:
+                # map_node has dropped its relocalization state; reflect the loss
+                # so the UI shows "not localized" and stops re-acquires from scratch.
+                self._localized = False
+        if dropped:
+            self.get_logger().warning(
+                f"[vio] tracking dropped to '{msg.data}', marking app not localized")
+            self._pub_state()
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #

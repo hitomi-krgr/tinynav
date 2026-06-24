@@ -376,6 +376,21 @@ class MapNode(Node):
         self.reloc_window_start_ts = None
         self.T_from_map_to_odom = None
 
+        # The VIO redefined the odom frame, so the live trajectory accumulated so
+        # far is in a stale frame. If we kept it, keyframe_mapping would bridge the
+        # last pre-drop keyframe to the first post-recovery keyframe with a relative
+        # constraint that spans two different odom frames -- a garbage edge that
+        # corrupts pose_graph_used_pose, making observed_T jump around the window so
+        # the debounce gate can never confirm a relocalization. Drop the whole live
+        # trajectory instead; keyframe_mapping then restarts a fresh segment (its
+        # `len(odom)==0 and last_keyframe_timestamp is None` branch) in the new odom
+        # frame, and observed_T is self-consistent again. The loaded map
+        # (map_poses/map_embeddings) is untouched.
+        self.odom = {}
+        self.pose_graph_used_pose = {}
+        self.relative_pose_constraint = []
+        self.last_keyframe_timestamp = None
+
     def localization_stop_callback(self, msg: Bool):
         if msg.data:
             self.get_logger().info("Received benchmark stop signal, starting save process...")
