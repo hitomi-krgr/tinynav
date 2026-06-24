@@ -580,16 +580,24 @@ class MapNode(Node):
         features = asyncio.run(self.super_point_extractor.infer(image))
         res, pose_in_camera, pose_cov_weight = self.relocalize_with_depth(image, features, self.K)
         if res:
-            # publish the relocalization pose for debug
             pose_in_world = np.linalg.inv(pose_in_camera)
             timestamp_ns = int(timestamp.sec * 1e9) + int(timestamp.nanosec)
-            self.relocation_pub.publish(np2msg(pose_in_world, timestamp, "world", "camera"))
 
             # Debounce: only commit observations that are consistent with the
-            # recent consecutive ones, to reject isolated wrong-DINO picks.
+            # recent ones, to reject isolated wrong-DINO picks. Until the window
+            # is full AND geometrically consistent we neither commit the pose nor
+            # announce relocalization, so T_from_map_to_odom stays None and
+            # try_publish_nav_path emits no target -> the robot holds still
+            # instead of chasing an unconverged transform during warmup / right
+            # after a VIO drop. Once the gate passes, the retained poi_index
+            # resumes navigation from where it stopped.
             if not self.accept_relocalization(timestamp_ns, pose_in_world):
                 return False, np.eye(4)
 
+            # Confirmed relocalization: announce it (drives the app's `localized`
+            # flag via /map/relocalization) and commit the observation to the
+            # map->odom solve.
+            self.relocation_pub.publish(np2msg(pose_in_world, timestamp, "world", "camera"))
             self.relocalization_poses[timestamp_ns] = pose_in_world
             self.relocalization_pose_weights[timestamp_ns] = pose_cov_weight
             return True, pose_in_world
@@ -636,16 +644,18 @@ class MapNode(Node):
         # Warm up by wall time since the first observation, NOT by the pruned
         # window span (pruning caps the span just under window_sec, so it could
         # never reach it and would block acceptance forever). During warmup we
-        # provisionally accept single frames so T_from_map_to_odom comes up
-        # immediately instead of after a 3 s blackout; the strict geometric-center
-        # gate only kicks in once the window is full.
+        # HOLD: reject (do not commit) so T_from_map_to_odom stays None and no
+        # target is published, keeping the robot stopped until the cluster has
+        # been observed for the full window and proven geometrically consistent.
+        # This trades a few seconds of standstill on (re)acquisition for not
+        # driving on a single, possibly-wrong DINO pick.
         elapsed_sec = (timestamp_ns - self.reloc_window_start_ts) / 1e9
         if elapsed_sec < self.reloc_debounce_window_sec:
             self.get_logger().info(
                 f"[reloc-debounce] ts={timestamp_ns} warming up, {elapsed_sec:.2f}s "
                 f"< {self.reloc_debounce_window_sec}s since first obs ({len(self.reloc_pending)} obs), "
-                f"provisionally accepting")
-            return True
+                f"holding (no target) until window is full")
+            return False
 
         window_span_sec = (timestamp_ns - self.reloc_pending[0][0]) / 1e9
         translations = np.array([t for _, t in self.reloc_pending])
