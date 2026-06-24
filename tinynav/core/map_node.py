@@ -10,6 +10,7 @@ import sys
 import json
 
 import heapq
+import collections
 from tinynav.core.math_utils import matrix_to_quat, msg2np, np2msg, estimate_pose, np2tf, rerank_by_pnp_inliers
 from sensor_msgs.msg import Image, CameraInfo
 from message_filters import TimeSynchronizer, Subscriber
@@ -245,6 +246,16 @@ class MapNode(Node):
         self.relocalization_poses = {}
         self.relocalization_pose_weights = {}
         self.failed_relocalizations = []
+
+        # Debounce for relocalization: a successful PnP is only committed to
+        # relocalization_poses (which feeds compute_transform_from_map_to_odom)
+        # if the observed T_from_map_to_odom is consistent with the recent
+        # consecutive observations. This rejects isolated wrong-DINO picks while
+        # still re-acquiring after a genuine, sustained shift (e.g. VIO restart).
+        self.reloc_debounce_window = 5          # require this many consecutive consistent observations
+        self.reloc_debounce_trans_thresh = 2.5  # meters
+        self.reloc_debounce_rot_thresh = np.deg2rad(60.0)  # radians
+        self.reloc_pending = collections.deque(maxlen=self.reloc_debounce_window)
 
         self.T_from_map_to_odom = None
 
@@ -540,12 +551,71 @@ class MapNode(Node):
             pose_in_world = np.linalg.inv(pose_in_camera)
             timestamp_ns = int(timestamp.sec * 1e9) + int(timestamp.nanosec)
             self.relocation_pub.publish(np2msg(pose_in_world, timestamp, "world", "camera"))
+
+            # Debounce: only commit observations that are consistent with the
+            # recent consecutive ones, to reject isolated wrong-DINO picks.
+            if not self.accept_relocalization(timestamp_ns, pose_in_world):
+                return False, np.eye(4)
+
             self.relocalization_poses[timestamp_ns] = pose_in_world
             self.relocalization_pose_weights[timestamp_ns] = pose_cov_weight
             return True, pose_in_world
         else:
             self.failed_relocalizations.append(timestamp)
             return False, np.eye(4)
+
+    def accept_relocalization(self, timestamp_ns: int, pose_in_world: np.ndarray) -> bool:
+        """
+        Sliding-window debounce on the observed map->odom transform.
+
+        Each successful PnP implies an observation of T_from_map_to_odom:
+            T = camera_in_odom_world @ inv(camera_in_map_world)
+        For correct relocalizations this transform is stable; a wrong-DINO pick
+        produces an outlier. We only accept an observation once the last
+        `reloc_debounce_window` consecutive observations agree within thresholds.
+        A genuine sustained shift (e.g. VIO restart) re-acquires naturally once
+        enough new-range observations accumulate.
+
+        Returns True if the observation should be committed.
+        """
+        if timestamp_ns not in self.pose_graph_used_pose:
+            # No odom counterpart to compare against; fall back to accepting.
+            self.get_logger().warning(f"[reloc-debounce] ts={timestamp_ns} no odom counterpart, accepting without check")
+            return True
+
+        camera_in_odom_world = self.pose_graph_used_pose[timestamp_ns]
+        observed_T = camera_in_odom_world @ np.linalg.inv(pose_in_world)
+        self.reloc_pending.append(observed_T)
+
+        if len(self.reloc_pending) < self.reloc_debounce_window:
+            self.get_logger().info(
+                f"[reloc-debounce] ts={timestamp_ns} warming up window "
+                f"{len(self.reloc_pending)}/{self.reloc_debounce_window}, holding")
+            return False
+
+        ref = self.reloc_pending[-1]
+        ref_inv = np.linalg.inv(ref)
+        max_trans_diff = 0.0
+        max_rot_diff = 0.0
+        for other in list(self.reloc_pending)[:-1]:
+            delta = ref_inv @ other
+            trans_diff = np.linalg.norm(delta[:3, 3])
+            cos_angle = (np.trace(delta[:3, :3]) - 1.0) / 2.0
+            rot_diff = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+            max_trans_diff = max(max_trans_diff, trans_diff)
+            max_rot_diff = max(max_rot_diff, rot_diff)
+
+        if max_trans_diff > self.reloc_debounce_trans_thresh or max_rot_diff > self.reloc_debounce_rot_thresh:
+            self.get_logger().warning(
+                f"[reloc-debounce] ts={timestamp_ns} REJECTED, inconsistent map->odom: "
+                f"max_trans_diff={max_trans_diff:.3f}m (thr {self.reloc_debounce_trans_thresh}m), "
+                f"max_rot_diff={np.rad2deg(max_rot_diff):.1f}deg (thr {np.rad2deg(self.reloc_debounce_rot_thresh):.1f}deg)")
+            return False
+
+        self.get_logger().info(
+            f"[reloc-debounce] ts={timestamp_ns} ACCEPTED, "
+            f"max_trans_diff={max_trans_diff:.3f}m, max_rot_diff={np.rad2deg(max_rot_diff):.1f}deg")
+        return True
 
     def save_relocalization_poses(self):
         if self._save_completed:
