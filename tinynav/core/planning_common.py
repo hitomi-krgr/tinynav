@@ -68,7 +68,7 @@ GO2_CONFIG = RobotConfig(
 
 B2_CONFIG = RobotConfig(
     name='b2', shape='square',
-    length=0.4, width=0.05,
+    length=0.6, width=0.05,
     camera_x=0.5, camera_y=0.0,
     control_x=0.0, control_y=0.0,
     safety_radius=0.2,
