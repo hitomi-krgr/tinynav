@@ -51,10 +51,10 @@ class CmdVelControlNode(Node):
         self.path_stale_stop_factor = 5.0
         self.max_linear_acc = 0.6   # m/s^2
         self.max_angular_acc = 0.8  # rad/s^2
-        # Match the planner's omega range (planning_common omega_y_samples = +/-pi/3);
+        # Match the planner's omega range (planning_common omega_y_samples = +/-pi/2);
         # capping below it would clip the planner's sharp turns and widen their radius
         # (the "tui tou" push-wide). The vx clip below likewise matches vx_max=0.5.
-        self.max_angular_speed = float(np.pi / 3)  # rad/s (~1.047), = planner omega max
+        self.max_angular_speed = float(np.pi / 2)  # rad/s (~1.571), = planner omega max
         self.planner_dt = 0.1       # trajectory dt in planning_node
         # planning_node publishes path with for j in range(..., step=10), so points are ~1.0 s apart.
         self.path_pose_stride = 10
