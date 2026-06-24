@@ -30,7 +30,7 @@ class CmdVelControlNode(Node):
         )
         # Camera sits this far ahead of the control center; heading must be referenced
         # at the control center or the short path lies behind the camera.
-        self.cam_forward_offset = 1.0
+        self.cam_forward_offset = 0.5
         self.T_camera_to_control = self.T_robot_to_camera.copy()
         self.T_camera_to_control[2, 3] = -self.cam_forward_offset  # back along camera +z (=forward)
         self.last_path_time = 0.0
