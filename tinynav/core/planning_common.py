@@ -677,28 +677,29 @@ class PlanningNodeBase(Node):
                 return
 
             # --- Stage 1: hard feasibility filter ---
-            # Collision (score == inf) is always rejected. Two further constraints
-            # are expressed as filters rather than large cost penalties:
+            # Only genuinely binding constraints are filters; everything that is a
+            # soft margin stays in the cost (Stage 2). Two hard constraints:
+            #   - collision (score == inf): the footprint touches an obstacle.
             #   - reverse gate: drive backward iff the corridor ahead is blocked.
-            #   - clearance: the whole footprint stays out of the safety band
-            #     (score == 0; score > 0 means it intrudes within safety_radius).
-            # They are applied lexicographically: prefer trajectories satisfying
-            # both, fall back to gate-only, then to any non-colliding trajectory,
-            # so a corridor narrower than the safety band still yields the
-            # least-bad motion instead of stalling the robot.
+            # Clearance (ESDF < safety_radius) is NOT a hard filter: safety_radius
+            # is a margin, not a collision boundary, and a corridor narrower than
+            # the band forces every forward trajectory to intrude into it. Filtering
+            # those out leaves only trajectories that score 0 by leaving the mapped
+            # grid (treated as "clear"), so the robot veers into the unknown instead
+            # of through the corridor. Clearance is handled softly below instead.
+            # The reverse gate is lexicographic: prefer gate-matching trajectories,
+            # fall back to any non-colliding one so the robot never stalls outright.
             non_collision = [i for i in range(len(trajectories)) if scores[i] != float('inf')]
             gate_ok = lambda i: (params[i][0] < 0.0) == should_reverse
-            clear_ok = lambda i: scores[i] <= 0.0
-            for candidate_filter in (lambda i: gate_ok(i) and clear_ok(i), gate_ok, lambda i: True):
+            for candidate_filter in (gate_ok, lambda i: True):
                 feasible = [i for i in non_collision if candidate_filter(i)]
                 if feasible:
                     break
 
             # --- Stage 2: soft preference cost over the feasible set ---
-            # Only preference terms remain: distance to the goal (primary), a
-            # smoothness term resisting command chatter, and the variant hook.
-            # The clearance term is a no-op on the primary tier (score == 0) and
-            # only orders the fallback tier by least intrusion into the safety band.
+            # Distance to the goal (primary), clearance (prefer staying out of the
+            # safety band, but yield to progress when a corridor forces intrusion),
+            # a smoothness term resisting command chatter, and the variant hook.
             def preference_cost(i):
                 traj, param = trajectories[i], params[i]
                 traj_end = np.array(traj[-1, :3])
