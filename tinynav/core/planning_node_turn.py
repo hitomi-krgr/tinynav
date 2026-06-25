@@ -14,7 +14,7 @@ from tinynav.core.planning_common import (
 #  point sits in open space." Reward trajectories whose turn START (where yaw
 #  first deviates) lands at a high omni-ESDF cell.
 TURN_YAW_EPS = np.deg2rad(15.0)   # |yaw - yaw0| above this => "omega took effect"
-K_TURN_CLEAR = 0.0
+K_TURN_CLEAR = 40.0
 
 
 def turn_start_clearance(traj, ESDF_map, origin, resolution, yaw_eps):
