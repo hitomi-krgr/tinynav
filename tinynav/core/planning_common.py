@@ -660,42 +660,14 @@ class PlanningNodeBase(Node):
         with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_len, rear_len, half_w = self.robot.footprint_from_control()
             scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, self.robot.safety_radius, front_len, rear_len, half_w)
-            top_k = 100
-            top_indices = np.argsort(scores, kind='stable')[:top_k]
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             enter_threshold = 0.30
+            should_reverse = front_clearance <= enter_threshold
 
             # Goal used in the cost function (variant-specific).
             target = self._resolve_target(T, ESDF_map, depth_msg)
-
-            def cost_function(traj, param, score, target_pose):
-                # predefined backward trajectory penalty
-                is_backward = param[0] < 0.0
-                should_reverse = front_clearance <= enter_threshold
-                reverse_gate_penalty = 1e9 if (should_reverse != is_backward) else 0.0
-
-                # regular trajectory penalty
-                traj_end = np.array(traj[-1, :3])
-                target_end = target_pose if target_pose is not None else traj_end
-                dist = np.linalg.norm(traj_end - target_end)
-
-                return (score * 100000
-                        + 100 * dist
-                        + 10 * abs(self.last_param[0] - param[0])
-                        + 10 * abs(self.last_param[1] - param[1])
-                        + reverse_gate_penalty
-                        + self._extra_cost(traj, ESDF_map))
-
-            top_k = 1
-            top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], target) for i in range(len(trajectories))]), kind='stable')[:top_k]
-            self.last_param = params[top_indices[0]]
-
-            # path
-            path = Path()
-            path.header = depth_msg.header
-            path.header.frame_id = "world"
 
             if self.target_pose is None:
                 return
@@ -703,6 +675,48 @@ class PlanningNodeBase(Node):
             if all(s == float('inf') for s in scores):
                 self.get_logger().info('All trajectories in collision, stopping path.')
                 return
+
+            # --- Stage 1: hard feasibility filter ---
+            # Collision (score == inf) is always rejected. Two further constraints
+            # are expressed as filters rather than large cost penalties:
+            #   - reverse gate: drive backward iff the corridor ahead is blocked.
+            #   - clearance: the whole footprint stays out of the safety band
+            #     (score == 0; score > 0 means it intrudes within safety_radius).
+            # They are applied lexicographically: prefer trajectories satisfying
+            # both, fall back to gate-only, then to any non-colliding trajectory,
+            # so a corridor narrower than the safety band still yields the
+            # least-bad motion instead of stalling the robot.
+            non_collision = [i for i in range(len(trajectories)) if scores[i] != float('inf')]
+            gate_ok = lambda i: (params[i][0] < 0.0) == should_reverse
+            clear_ok = lambda i: scores[i] <= 0.0
+            for candidate_filter in (lambda i: gate_ok(i) and clear_ok(i), gate_ok, lambda i: True):
+                feasible = [i for i in non_collision if candidate_filter(i)]
+                if feasible:
+                    break
+
+            # --- Stage 2: soft preference cost over the feasible set ---
+            # Only preference terms remain: distance to the goal (primary), a
+            # smoothness term resisting command chatter, and the variant hook.
+            # The clearance term is a no-op on the primary tier (score == 0) and
+            # only orders the fallback tier by least intrusion into the safety band.
+            def preference_cost(i):
+                traj, param = trajectories[i], params[i]
+                traj_end = np.array(traj[-1, :3])
+                target_end = target if target is not None else traj_end
+                dist = np.linalg.norm(traj_end - target_end)
+                smooth = abs(self.last_param[0] - param[0]) + abs(self.last_param[1] - param[1])
+                return (scores[i] * 100000
+                        + 100 * dist
+                        + 10 * smooth
+                        + self._extra_cost(traj, ESDF_map))
+
+            top_indices = [min(feasible, key=preference_cost)]
+            self.last_param = params[top_indices[0]]
+
+            # path
+            path = Path()
+            path.header = depth_msg.header
+            path.header.frame_id = "world"
 
             for i in top_indices:
                 for j in range(0, len(trajectories[i]), 10):

@@ -257,6 +257,13 @@ class MapNode(Node):
         self.reloc_debounce_trans_thresh = 2.5  # meters, max distance from the window's geometric center
         self.reloc_pending = collections.deque()  # (timestamp_ns, observed map->odom translation), time-pruned
         self.reloc_window_start_ts = None         # ts of the first observation since (re)start, for warmup gating
+        # First-ever (cold start) acquisition shortcut: confirm as soon as this
+        # many observations agree geometrically, instead of holding for the full
+        # reloc_debounce_window_sec. Re-acquisition after a VIO drop still uses
+        # the full time window (more conservative). Persists across resets so
+        # only the very first localization gets the fast path.
+        self.reloc_first_acq_min_obs = 3
+        self._ever_localized = False
 
         # VIO restart handling: when the VIO drops out of tracking the odom frame
         # is invalidated/redefined, so all accumulated relocalization observations
@@ -665,7 +672,13 @@ class MapNode(Node):
         # This trades a few seconds of standstill on (re)acquisition for not
         # driving on a single, possibly-wrong DINO pick.
         elapsed_sec = (timestamp_ns - self.reloc_window_start_ts) / 1e9
-        if elapsed_sec < self.reloc_debounce_window_sec:
+        # Cold start: accept once a few observations agree (geometric check below)
+        # rather than waiting out the full time window, so the robot starts moving
+        # quickly on first acquisition. Post-VIO-drop re-acquisition keeps the
+        # conservative time-based warmup.
+        warm_by_count = (not self._ever_localized
+                         and len(self.reloc_pending) >= self.reloc_first_acq_min_obs)
+        if elapsed_sec < self.reloc_debounce_window_sec and not warm_by_count:
             self.get_logger().info(
                 f"[reloc-debounce] ts={timestamp_ns} warming up, {elapsed_sec:.2f}s "
                 f"< {self.reloc_debounce_window_sec}s since first obs ({len(self.reloc_pending)} obs), "
@@ -687,6 +700,7 @@ class MapNode(Node):
         self.get_logger().info(
             f"[reloc-debounce] ts={timestamp_ns} ACCEPTED, max dist from center "
             f"{max_dist:.3f}m ({len(self.reloc_pending)} obs over {window_span_sec:.2f}s)")
+        self._ever_localized = True
         return True
 
     def save_relocalization_poses(self):
