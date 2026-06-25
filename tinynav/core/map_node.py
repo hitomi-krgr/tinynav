@@ -257,11 +257,12 @@ class MapNode(Node):
         self.reloc_debounce_trans_thresh = 2.5  # meters, max distance from the window's geometric center
         self.reloc_pending = collections.deque()  # (timestamp_ns, observed map->odom translation), time-pruned
         self.reloc_window_start_ts = None         # ts of the first observation since (re)start, for warmup gating
-        # First-ever (cold start) acquisition shortcut: confirm as soon as this
-        # many observations agree geometrically, instead of holding for the full
-        # reloc_debounce_window_sec. Re-acquisition after a VIO drop still uses
-        # the full time window (more conservative). Persists across resets so
-        # only the very first localization gets the fast path.
+        # First-ever (cold start) acquisition shortcut: confirm on the very first
+        # successful PnP (single frame), instead of holding for the full
+        # reloc_debounce_window_sec -- the time-based warmup was preventing the
+        # robot from ever locking on at startup. Re-acquisition after a VIO drop
+        # still uses the full time window (more conservative). Persists across
+        # resets so only the very first localization gets the fast path.
         self.reloc_first_acq_min_obs = 3
         self._ever_localized = False
 
