@@ -253,18 +253,13 @@ class MapNode(Node):
         # if the observed T_from_map_to_odom is consistent with the recent
         # consecutive observations. This rejects isolated wrong-DINO picks while
         # still re-acquiring after a genuine, sustained shift (e.g. VIO restart).
-        self.reloc_debounce_window_sec = 3.0    # observations within this trailing time window must agree
         self.reloc_debounce_trans_thresh = 2.5  # meters, max distance from the window's geometric center
-        self.reloc_pending = collections.deque()  # (timestamp_ns, observed map->odom translation), time-pruned
-        self.reloc_window_start_ts = None         # ts of the first observation since (re)start, for warmup gating
-        # First-ever (cold start) acquisition shortcut: confirm on the very first
-        # successful PnP (single frame), instead of holding for the full
-        # reloc_debounce_window_sec -- the time-based warmup was preventing the
-        # robot from ever locking on at startup. Re-acquisition after a VIO drop
-        # still uses the full time window (more conservative). Persists across
-        # resets so only the very first localization gets the fast path.
-        self.reloc_first_acq_min_obs = 3
-        self._ever_localized = False
+        # Count-based debounce: keep the trailing `reloc_min_obs` successful-PnP
+        # observations and accept the new one only once we have that many AND they
+        # all agree geometrically. Both cold-start and post-VIO-drop re-acquisition
+        # use the same frame-count gate (5 frames) instead of a wall-clock window.
+        self.reloc_min_obs = 5
+        self.reloc_pending = collections.deque(maxlen=self.reloc_min_obs)  # (timestamp_ns, observed map->odom translation)
 
         # VIO restart handling: when the VIO drops out of tracking the odom frame
         # is invalidated/redefined, so all accumulated relocalization observations
@@ -381,7 +376,6 @@ class MapNode(Node):
         self.relocalization_poses = {}
         self.relocalization_pose_weights = {}
         self.reloc_pending.clear()
-        self.reloc_window_start_ts = None
         self.T_from_map_to_odom = None
 
         # The VIO redefined the odom frame, so the live trajectory accumulated so
@@ -630,21 +624,21 @@ class MapNode(Node):
 
     def accept_relocalization(self, timestamp_ns: int, pose_in_world: np.ndarray) -> bool:
         """
-        Time-windowed debounce on the observed map->odom transform.
+        Count-based debounce on the observed map->odom transform.
 
         Each successful PnP implies an observation of T_from_map_to_odom:
             T = camera_in_odom_world @ inv(camera_in_map_world)
         For correct relocalizations the translation of this transform is stable;
-        a wrong-DINO pick produces an outlier. We keep every observation from the
-        trailing `reloc_debounce_window_sec` seconds and accept the new one only if
-        the window already spans that full duration AND every observation in it
-        lies within `reloc_debounce_trans_thresh` of the window's geometric center.
+        a wrong-DINO pick produces an outlier. We keep the trailing `reloc_min_obs`
+        observations and accept the new one only once we have that many AND every
+        observation in the window lies within `reloc_debounce_trans_thresh` of the
+        window's geometric center.
 
         Distance is measured against the geometric center (mean) of the window, not
         the first point, so the threshold is symmetric about the cluster. Rotation
         is not checked (max vx 0.3, ~5 s trajectory makes translation sufficient).
         A genuine sustained shift (e.g. VIO restart) re-acquires once the stale
-        observations age out of the window.
+        observations age out of the bounded window.
 
         Returns True if the observation should be committed.
         """
@@ -656,37 +650,21 @@ class MapNode(Node):
         camera_in_odom_world = self.pose_graph_used_pose[timestamp_ns]
         observed_T = camera_in_odom_world @ np.linalg.inv(pose_in_world)
         self.reloc_pending.append((timestamp_ns, observed_T[:3, 3].copy()))
-        if self.reloc_window_start_ts is None:
-            self.reloc_window_start_ts = timestamp_ns
 
-        # Drop observations older than the trailing time window.
-        window_ns = self.reloc_debounce_window_sec * 1e9
-        while self.reloc_pending and (timestamp_ns - self.reloc_pending[0][0]) > window_ns:
-            self.reloc_pending.popleft()
-
-        # Warm up by wall time since the first observation, NOT by the pruned
-        # window span (pruning caps the span just under window_sec, so it could
-        # never reach it and would block acceptance forever). During warmup we
-        # HOLD: reject (do not commit) so T_from_map_to_odom stays None and no
-        # target is published, keeping the robot stopped until the cluster has
-        # been observed for the full window and proven geometrically consistent.
-        # This trades a few seconds of standstill on (re)acquisition for not
-        # driving on a single, possibly-wrong DINO pick.
-        elapsed_sec = (timestamp_ns - self.reloc_window_start_ts) / 1e9
-        # Cold start: accept once a few observations agree (geometric check below)
-        # rather than waiting out the full time window, so the robot starts moving
-        # quickly on first acquisition. Post-VIO-drop re-acquisition keeps the
-        # conservative time-based warmup.
-        warm_by_count = (not self._ever_localized
-                         and len(self.reloc_pending) >= self.reloc_first_acq_min_obs)
-        if elapsed_sec < self.reloc_debounce_window_sec and not warm_by_count:
+        # Warm up by frame count: HOLD (reject, leaving T_from_map_to_odom None so
+        # no target is published and the robot stays stopped) until we have
+        # accumulated `reloc_min_obs` successful PnP observations. The deque is
+        # bounded to that length, so it always holds the trailing N. This trades a
+        # few frames of standstill on (re)acquisition for not driving on a single,
+        # possibly-wrong DINO pick. Cold start and post-VIO-drop re-acquisition use
+        # the same gate.
+        if len(self.reloc_pending) < self.reloc_min_obs:
             self.get_logger().info(
-                f"[reloc-debounce] ts={timestamp_ns} warming up, {elapsed_sec:.2f}s "
-                f"< {self.reloc_debounce_window_sec}s since first obs ({len(self.reloc_pending)} obs), "
-                f"holding (no target) until window is full")
+                f"[reloc-debounce] ts={timestamp_ns} warming up, "
+                f"{len(self.reloc_pending)}/{self.reloc_min_obs} obs, "
+                f"holding (no target) until enough frames agree")
             return False
 
-        window_span_sec = (timestamp_ns - self.reloc_pending[0][0]) / 1e9
         translations = np.array([t for _, t in self.reloc_pending])
         center = translations.mean(axis=0)
         max_dist = np.linalg.norm(translations - center, axis=1).max()
@@ -695,13 +673,12 @@ class MapNode(Node):
             self.get_logger().warning(
                 f"[reloc-debounce] ts={timestamp_ns} REJECTED, max dist from center "
                 f"{max_dist:.3f}m > {self.reloc_debounce_trans_thresh}m "
-                f"({len(self.reloc_pending)} obs over {window_span_sec:.2f}s)")
+                f"({len(self.reloc_pending)} obs)")
             return False
 
         self.get_logger().info(
             f"[reloc-debounce] ts={timestamp_ns} ACCEPTED, max dist from center "
-            f"{max_dist:.3f}m ({len(self.reloc_pending)} obs over {window_span_sec:.2f}s)")
-        self._ever_localized = True
+            f"{max_dist:.3f}m ({len(self.reloc_pending)} obs)")
         return True
 
     def save_relocalization_poses(self):

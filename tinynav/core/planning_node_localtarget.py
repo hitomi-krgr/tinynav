@@ -13,17 +13,16 @@ from tinynav.core.planning_common import (
     score_trajectories_by_ESDF, roll_occupancy_grid,
 )
 
-# --- local-target lookahead tuning -----------------------------------------
-HEADING_CLIP_RAD = 1.05        # ~60°: stop the lookahead once the global path has bent
-                               # this far from its entry direction, so the target stays at
-                               # a corner instead of past it (avoids corner-cutting).
-
+# How far the straight line robot->aim may drift from the global path before it is
+# treated as cutting a corner. Larger = look further ahead but allow more shortcut.
+CUT_TOLERANCE_M = 0.2
 
 # === PlanningNode class ===
 class PlanningNode(PlanningNodeBase):
-    """Local-target planner: walks the global path and emits a goal-attractor point
-    on it, shortening the lookahead at obstacles and corners (an attention clip).
-    Lateral obstacle avoidance is left to the base trajectory scorer."""
+    """Local-target planner: aims at the furthest point on the global path that the
+    robot can head straight to without cutting a corner. This keeps the route on the
+    polyline instead of slicing across bends; obstacle avoidance stays with the base
+    trajectory scorer."""
 
     def _setup_extras(self):
         self._last_local_target = None
@@ -55,61 +54,49 @@ class PlanningNode(PlanningNodeBase):
         self.global_path_odom = (T_om @ pts_h.T).T[:, :3]
 
     def _compute_local_target(self, T, ESDF_map):
-        """Local target = a point ON the global path with the lookahead shortened.
+        """Local target = the furthest point on the global path the robot can aim at
+        without the straight line to it cutting a corner.
 
-        Not a planner -- an attention/lookahead clip. Lateral obstacle avoidance is
-        left to the base trajectory scorer; this only decides *how far ahead* on the
-        global path the goal-attractor should sit, so it never lands past an obstacle
-        or around a corner (which would make the device cut the corner or swing its
-        head toward a target hidden behind a wall). Returns np.ndarray or None.
+        This is the one thing the base DWA cannot do for itself: the cost only pulls
+        a trajectory's *endpoint* toward a single goal point, so aiming past a corner
+        makes the robot slice diagonally across it (a Bezier shortcut). Obstacle
+        avoidance is NOT done here -- that is the scorer's job; this only chooses the
+        aim point. Returns np.ndarray or None.
 
-        Walk the path forward from the robot; stop at the first of:
-          - clearance: an on-path cell whose ESDF drops below the safety radius
-            (an obstacle has landed on the path) -> last point before it;
-          - curvature: the path has bent HEADING_CLIP_RAD from its entry direction
-            (a corner) -> the corner itself, so the robot drives to it head-on;
-          - the global target.
+        Extend the aim point along the path while the chord robot->P[k] stays within
+        CUT_TOLERANCE_M of every intermediate path point (i.e. the straight line still
+        hugs the path). Stop where extending further would shortcut a bend, so the aim
+        lands at the corner and the robot drives to it head-on before turning.
         """
         if (self.target_pose is None or self.global_path_odom is None
                 or len(self.global_path_odom) < 2):
             return None
 
-        init_p_w = self.camera_to_robot_center(T)
+        robot = self.camera_to_robot_center(T)[:2]
         path_xy = self.global_path_odom[:, :2]
-        start_idx = int(np.argmin(np.linalg.norm(path_xy - init_p_w[:2], axis=1)))
+        start_idx = int(np.argmin(np.linalg.norm(path_xy - robot, axis=1)))
         target_idx = int(np.argmin(np.linalg.norm(path_xy - self.target_pose[:2], axis=1)))
-
-        step = self.resolution
-        safety = self.robot.safety_radius
         target_z = float(self.target_pose[2])
-        rows, cols = ESDF_map.shape
+        if target_idx <= start_idx:
+            return None
 
-        last = None
-        entry_dir = None
-        for i in range(start_idx, min(target_idx, len(path_xy) - 1)):
-            seg = path_xy[i + 1] - path_xy[i]
-            seg_len = float(np.linalg.norm(seg))
-            if seg_len < 1e-6:
+        aim_idx = start_idx
+        for k in range(start_idx + 1, target_idx + 1):
+            chord = path_xy[k] - robot
+            L = float(np.linalg.norm(chord))
+            if L < 1e-6:
+                aim_idx = k
                 continue
-            seg_dir = seg / seg_len
-            if entry_dir is None:
-                entry_dir = seg_dir
-            else:
-                # Curvature clip: signed angle of this segment vs the entry heading.
-                turn = abs(np.arctan2(seg_dir[0] * entry_dir[1] - seg_dir[1] * entry_dir[0],
-                                      float(seg_dir @ entry_dir)))
-                if turn > HEADING_CLIP_RAD:
-                    return last
-            n_seg = max(1, int(seg_len / step))
-            for s in range(1, n_seg + 1):
-                anchor = path_xy[i] + seg * (s / n_seg)
-                ex = int((anchor[0] - self.origin[0]) / self.resolution)
-                ey = int((anchor[1] - self.origin[1]) / self.resolution)
-                sdf_here = ESDF_map[ex, ey] if (0 <= ex < rows and 0 <= ey < cols) else -1.0
-                if sdf_here < safety:        # obstacle on the path ahead -> clip before it
-                    return last
-                last = np.array([anchor[0], anchor[1], target_z])
-        return last
+            d = chord / L
+            # perpendicular distance of every path point start..k to the chord line
+            rel = path_xy[start_idx:k + 1] - robot
+            cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
+            if cross.max() > CUT_TOLERANCE_M:    # going to P[k] would shortcut a bend
+                break
+            aim_idx = k
+
+        aim = path_xy[aim_idx]
+        return np.array([aim[0], aim[1], target_z])
 
     def _resolve_target(self, T, ESDF_map, depth_msg):
         # ESDF-snapped lookahead along global path; falls back to raw target_pose.
