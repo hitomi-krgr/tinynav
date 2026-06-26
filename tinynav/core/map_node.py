@@ -257,8 +257,8 @@ class MapNode(Node):
         # Count-based debounce: keep the trailing `reloc_min_obs` successful-PnP
         # observations and accept the new one only once we have that many AND they
         # all agree geometrically. Both cold-start and post-VIO-drop re-acquisition
-        # use the same frame-count gate (5 frames) instead of a wall-clock window.
-        self.reloc_min_obs = 5
+        # use the same frame-count gate (3 frames) instead of a wall-clock window.
+        self.reloc_min_obs = 3
         self.reloc_pending = collections.deque(maxlen=self.reloc_min_obs)  # (timestamp_ns, observed map->odom translation)
 
         # VIO restart handling: when the VIO drops out of tracking the odom frame
