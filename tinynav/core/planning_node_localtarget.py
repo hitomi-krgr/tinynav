@@ -13,9 +13,11 @@ from tinynav.core.planning_common import (
     score_trajectories_by_ESDF, roll_occupancy_grid,
 )
 
-# How far the straight line robot->aim may drift from the global path before it is
-# treated as cutting a corner. Larger = look further ahead but allow more shortcut.
-CUT_TOLERANCE_M = 0.2
+# Lookahead point selection on the global path.
+SMOOTH_M       = 0.5            # arc length used to smooth the path heading (kills A* grid jaggedness)
+LOOKAHEAD_MAX  = 2.0            # extend the aim this far on straight/gentle path (~traj horizon -> full speed)
+CORNER_ANGLE   = np.deg2rad(60) # only a bend sharper than this counts as a corner to stop the aim at;
+                                # gentler bends are treated as straight so the aim stays long (fast, smooth).
 
 # === PlanningNode class ===
 class PlanningNode(PlanningNodeBase):
@@ -54,19 +56,16 @@ class PlanningNode(PlanningNodeBase):
         self.global_path_odom = (T_om @ pts_h.T).T[:, :3]
 
     def _compute_local_target(self, T):
-        """Local target = the furthest point on the global path the robot can aim at
-        without the straight line to it cutting a corner.
+        """Local target = a lookahead point on the global path.
 
-        This is the one thing the base DWA cannot do for itself: the cost only pulls
-        a trajectory's *endpoint* toward a single goal point, so aiming past a corner
-        makes the robot slice diagonally across it (a Bezier shortcut). Obstacle
-        avoidance is NOT done here -- that is the scorer's job; this only chooses the
-        aim point. Returns np.ndarray or None.
-
-        Extend the aim point along the path while the chord robot->P[k] stays within
-        CUT_TOLERANCE_M of every intermediate path point (i.e. the straight line still
-        hugs the path). Stop where extending further would shortcut a bend, so the aim
-        lands at the corner and the robot drives to it head-on before turning.
+        The base DWA only pulls a trajectory's *endpoint* toward one goal point, so
+        the aim point governs both heading and speed: too far past a corner makes the
+        robot slice across it (Bezier); too near makes the matched arc slow. So extend
+        the aim along the path up to LOOKAHEAD_MAX (~the trajectory horizon, for full
+        speed) on straight/gently-curving path, and stop earlier only at a real corner
+        (heading bent > CORNER_ANGLE) so the robot drives to the corner instead of
+        cutting it. Obstacle avoidance is NOT done here -- that is the scorer's job.
+        Returns np.ndarray or None.
         """
         if (self.target_pose is None or self.global_path_odom is None
                 or len(self.global_path_odom) < 2):
@@ -74,25 +73,38 @@ class PlanningNode(PlanningNodeBase):
 
         robot = self.camera_to_robot_center(T)[:2]
         path_xy = self.global_path_odom[:, :2]
+        n = len(path_xy)
         start_idx = int(np.argmin(np.linalg.norm(path_xy - robot, axis=1)))
         target_idx = int(np.argmin(np.linalg.norm(path_xy - self.target_pose[:2], axis=1)))
         target_z = float(self.target_pose[2])
         if target_idx <= start_idx:
             return None
 
+        # Arc length from path[0]; used for both the smoothing window and the cap.
+        cum = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(path_xy, axis=0), axis=1))))
+
+        def smoothed_dir(i):
+            """Unit path heading at i, averaged over SMOOTH_M ahead (ignores grid jaggedness)."""
+            j = i
+            while j < n - 1 and cum[j] - cum[i] < SMOOTH_M:
+                j += 1
+            d = path_xy[j] - path_xy[i]
+            L = float(np.linalg.norm(d))
+            return d / L if L > 1e-6 else None
+
+        entry_dir = smoothed_dir(start_idx)
         aim_idx = start_idx
         for k in range(start_idx + 1, target_idx + 1):
-            chord = path_xy[k] - robot
-            L = float(np.linalg.norm(chord))
-            if L < 1e-6:
+            if cum[k] - cum[start_idx] >= LOOKAHEAD_MAX:   # far enough for full speed
                 aim_idx = k
-                continue
-            d = chord / L
-            # perpendicular distance of every path point start..k to the chord line
-            rel = path_xy[start_idx:k + 1] - robot
-            cross = np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])
-            if cross.max() > CUT_TOLERANCE_M:    # going to P[k] would shortcut a bend
                 break
+            dir_k = smoothed_dir(k)
+            if entry_dir is not None and dir_k is not None:
+                turn = abs(np.arctan2(dir_k[0] * entry_dir[1] - dir_k[1] * entry_dir[0],
+                                      float(dir_k @ entry_dir)))
+                if turn >= CORNER_ANGLE:                   # real corner -> stop at it, don't cut
+                    aim_idx = k
+                    break
             aim_idx = k
 
         aim = path_xy[aim_idx]
