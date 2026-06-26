@@ -53,7 +53,7 @@ class PlanningNode(PlanningNodeBase):
         pts_h = np.hstack([pts, np.ones((len(pts), 1))])
         self.global_path_odom = (T_om @ pts_h.T).T[:, :3]
 
-    def _compute_local_target(self, T, ESDF_map):
+    def _compute_local_target(self, T):
         """Local target = the furthest point on the global path the robot can aim at
         without the straight line to it cutting a corner.
 
@@ -99,8 +99,8 @@ class PlanningNode(PlanningNodeBase):
         return np.array([aim[0], aim[1], target_z])
 
     def _resolve_target(self, T, ESDF_map, depth_msg):
-        # ESDF-snapped lookahead along global path; falls back to raw target_pose.
-        ct = self._compute_local_target(T, ESDF_map)
+        # Corner-respecting lookahead on the global path; falls back to raw target_pose.
+        ct = self._compute_local_target(T)
         local_target = ct if ct is not None else self.target_pose
 
         # Temporal low-pass; only smooth the local-target output, not the raw fallback.
