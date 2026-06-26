@@ -20,7 +20,7 @@ trajectory on the map.
         python3 tool/planning_node_compare.py \
             tinynav/core/planning_node.py \
             tinynav/core/planning_node_turn.py \
-            tinynav/core/planning_node_centerline.py \
+            tinynav/core/planning_node_localtarget.py \
             --map tinynav_db/maps/<map_dir> --pois "home,printer"
 
 Plot lands in <out>/<route>.png (all nodes overlaid on the map).
@@ -252,9 +252,26 @@ def load_map(map_dir):
     }
 
 
-def map_scene(mapd, names, path_stride=3):
-    """Build a Scene from a POI waypoint sequence (>=2): chain SDF-A* between
-    consecutive POIs into one global path; obstacles = map occupied cells."""
+def load_start_from_poses(map_dir):
+    """Earliest-timestamp pose translation from the recorded mapping trajectory.
+    poses.npy is a pickled {timestamp_ns: 4x4} dict; the first frame is where the
+    robot began mapping -> a realistic, on-floor start (unlike a POI, which is a
+    target that may sit against a wall). Returns (x, y, z) or None."""
+    p = os.path.join(map_dir, "poses.npy")
+    if not os.path.exists(p):
+        return None
+    d = np.load(p, allow_pickle=True).item()
+    if not d:
+        return None
+    pose0 = np.asarray(d[min(d.keys())])
+    return tuple(float(v) for v in pose0[:3, 3])
+
+
+def map_scene(mapd, names, path_stride=3, start_w=None):
+    """Build a Scene from waypoints: chain SDF-A* between consecutive waypoints
+    into one global path; obstacles = map occupied cells. With start_w given, the
+    route is start_w -> POIs (so a single-POI map is still a runnable route and
+    the start is the recorded mapping origin instead of a POI)."""
     pois = mapd["pois"]
     for nm in names:
         if nm not in pois:
@@ -265,19 +282,25 @@ def map_scene(mapd, names, path_stride=3):
     def w2i(p):
         return (int((p[0] - ox) / res), int((p[1] - oy) / res), int((p[2] - oz) / res))
 
+    waypts = ([np.asarray(start_w, dtype=np.float64)] if start_w is not None else []) \
+        + [np.asarray(pois[n], dtype=np.float64) for n in names]
+    if len(waypts) < 2:
+        raise SystemExit("need >=2 waypoints (use --start-from-poses for single-POI maps)")
+
     idx_path = []
-    for a, b in zip(names[:-1], names[1:]):
-        seg = _map_astar(w2i(pois[a]), w2i(pois[b]), sdf, occ, res)
+    for a, b in zip(waypts[:-1], waypts[1:]):
+        seg = _map_astar(w2i(a), w2i(b), sdf, occ, res)
         if not seg:
-            raise SystemExit(f"no global path {a}->{b}")
+            raise SystemExit(f"no global path ({a[:2]} -> {b[:2]})")
         idx_path.extend(seg if not idx_path else seg[1:])
     path_w = [(i * res + ox, j * res + oy) for (i, j, _k) in idx_path[::path_stride]]
     end_w = (idx_path[-1][0] * res + ox, idx_path[-1][1] * res + oy)
     if path_w[-1] != end_w:
         path_w.append(end_w)
-    sw, gw = pois[names[0]], pois[names[-1]]
+    sw, gw = waypts[0], waypts[-1]
     yaw0 = float(np.arctan2(path_w[1][1] - sw[1], path_w[1][0] - sw[0])) if len(path_w) >= 2 else 0.0
-    return Scene(name="map_" + "_".join(names),
+    tag = ("start_" if start_w is not None else "") + "_".join(names)
+    return Scene(name="map_" + tag,
                  global_path_pts=path_w,
                  robot=(float(sw[0]), float(sw[1]), yaw0),
                  target=np.array([gw[0], gw[1], gw[2]], dtype=np.float64),
@@ -452,6 +475,10 @@ def reset_node_state(node):
 
 
 def reset_controller_state(ctrl):
+    # cmd_vel_control gates all output on /nav/active (added in #138, after this
+    # harness was written). Nothing publishes that topic in sim, so force the
+    # controller active or it returns zero cmd forever and the robot never moves.
+    ctrl._nav_active = True
     ctrl.pose = None
     ctrl.path = None
     ctrl.latest_cmd = Twist()
@@ -610,6 +637,9 @@ def main():
     ap.add_argument("--max-time", type=float, default=None, help="sim-seconds budget per route")
     ap.add_argument("--robot", choices=["go2", "b2"], default="go2",
                     help="override the robot config in the loaded nodes (deployment files unchanged)")
+    ap.add_argument("--start-from-poses", action="store_true",
+                    help="use poses.npy[earliest] as the route start (route = start -> POIs); "
+                         "lets single-POI maps run and starts from the recorded mapping origin")
     args = ap.parse_args()
 
     global CMDVEL_MAX_T, CAM_FORWARD_OFFSET
@@ -619,12 +649,15 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     mapd = load_map(args.map)
     print(f"map: {args.map} | POIs: {sorted(mapd['pois'])}", flush=True)
+    start_w = load_start_from_poses(args.map) if args.start_from_poses else None
+    if args.start_from_poses and start_w is None:
+        raise SystemExit("--start-from-poses set but no usable poses.npy in the map dir")
     routes = []
     for route in args.pois.split(";"):
         names = [x.strip() for x in route.split(",") if x.strip()]
-        if len(names) < 2:
-            raise SystemExit("each --pois route needs >=2 POIs")
-        routes.append(map_scene(mapd, names))
+        if not names or (start_w is None and len(names) < 2):
+            raise SystemExit("each --pois route needs >=2 POIs (or pass --start-from-poses)")
+        routes.append(map_scene(mapd, names, start_w=start_w))
 
     labels = [os.path.splitext(os.path.basename(p))[0] for p in args.paths]
     results = [[None] * len(args.paths) for _ in routes]
