@@ -10,7 +10,6 @@ import sys
 import json
 
 import heapq
-import collections
 from tinynav.core.math_utils import matrix_to_quat, msg2np, np2msg, estimate_pose, np2tf, rerank_by_pnp_inliers
 from sensor_msgs.msg import Image, CameraInfo
 from message_filters import TimeSynchronizer, Subscriber
@@ -248,19 +247,6 @@ class MapNode(Node):
         self.relocalization_pose_weights = {}
         self.failed_relocalizations = []
 
-        # Debounce for relocalization: a successful PnP is only committed to
-        # relocalization_poses (which feeds compute_transform_from_map_to_odom)
-        # if the observed T_from_map_to_odom is consistent with the recent
-        # consecutive observations. This rejects isolated wrong-DINO picks while
-        # still re-acquiring after a genuine, sustained shift (e.g. VIO restart).
-        self.reloc_debounce_trans_thresh = 2.5  # meters, max distance from the window's geometric center
-        # Count-based debounce: keep the trailing `reloc_min_obs` successful-PnP
-        # observations and accept the new one only once we have that many AND they
-        # all agree geometrically. Both cold-start and post-VIO-drop re-acquisition
-        # use the same frame-count gate (3 frames) instead of a wall-clock window.
-        self.reloc_min_obs = 3
-        self.reloc_pending = collections.deque(maxlen=self.reloc_min_obs)  # (timestamp_ns, observed map->odom translation)
-
         # VIO restart handling: when the VIO drops out of tracking the odom frame
         # is invalidated/redefined, so all accumulated relocalization observations
         # become stale. Watch /slam/vio_status and reset the relocalization state
@@ -269,9 +255,8 @@ class MapNode(Node):
         self.vio_tracking_states = {"TRACKING", "TRACKING_STATIC"}
         self.vio_was_tracking = False
 
-        # Robust (Huber) IRLS for the map->odom solve: the debounce gate rejects
-        # gross wrong-DINO outliers, this down-weights the medium ones that slip
-        # through so a single off observation can't drag T_from_map_to_odom.
+        # Robust (Huber) IRLS for the map->odom solve: down-weights outlier
+        # observations so a single off observation can't drag T_from_map_to_odom.
         self.reloc_irls_iterations = 3      # re-weight / re-solve rounds
         self.reloc_huber_delta = 0.3        # meters; residuals beyond this are down-weighted ~delta/r
 
@@ -375,15 +360,13 @@ class MapNode(Node):
     def reset_relocalization_state(self):
         self.relocalization_poses = {}
         self.relocalization_pose_weights = {}
-        self.reloc_pending.clear()
         self.T_from_map_to_odom = None
 
         # The VIO redefined the odom frame, so the live trajectory accumulated so
         # far is in a stale frame. If we kept it, keyframe_mapping would bridge the
         # last pre-drop keyframe to the first post-recovery keyframe with a relative
         # constraint that spans two different odom frames -- a garbage edge that
-        # corrupts pose_graph_used_pose, making observed_T jump around the window so
-        # the debounce gate can never confirm a relocalization. Drop the whole live
+        # corrupts pose_graph_used_pose. Drop the whole live
         # trajectory instead; keyframe_mapping then restarts a fresh segment (its
         # `len(odom)==0 and last_keyframe_timestamp is None` branch) in the new odom
         # frame, and observed_T is self-consistent again. The loaded map
@@ -597,23 +580,9 @@ class MapNode(Node):
         features = asyncio.run(self.super_point_extractor.infer(image))
         res, pose_in_camera, pose_cov_weight = self.relocalize_with_depth(image, features, self.K)
         if res:
+            # publish the relocalization pose for debug
             pose_in_world = np.linalg.inv(pose_in_camera)
             timestamp_ns = int(timestamp.sec * 1e9) + int(timestamp.nanosec)
-
-            # Debounce: only commit observations that are consistent with the
-            # recent ones, to reject isolated wrong-DINO picks. Until the window
-            # is full AND geometrically consistent we neither commit the pose nor
-            # announce relocalization, so T_from_map_to_odom stays None and
-            # try_publish_nav_path emits no target -> the robot holds still
-            # instead of chasing an unconverged transform during warmup / right
-            # after a VIO drop. Once the gate passes, the retained poi_index
-            # resumes navigation from where it stopped.
-            if not self.accept_relocalization(timestamp_ns, pose_in_world):
-                return False, np.eye(4)
-
-            # Confirmed relocalization: announce it (drives the app's `localized`
-            # flag via /map/relocalization) and commit the observation to the
-            # map->odom solve.
             self.relocation_pub.publish(np2msg(pose_in_world, timestamp, "world", "camera"))
             self.relocalization_poses[timestamp_ns] = pose_in_world
             self.relocalization_pose_weights[timestamp_ns] = pose_cov_weight
@@ -621,65 +590,6 @@ class MapNode(Node):
         else:
             self.failed_relocalizations.append(timestamp)
             return False, np.eye(4)
-
-    def accept_relocalization(self, timestamp_ns: int, pose_in_world: np.ndarray) -> bool:
-        """
-        Count-based debounce on the observed map->odom transform.
-
-        Each successful PnP implies an observation of T_from_map_to_odom:
-            T = camera_in_odom_world @ inv(camera_in_map_world)
-        For correct relocalizations the translation of this transform is stable;
-        a wrong-DINO pick produces an outlier. We keep the trailing `reloc_min_obs`
-        observations and accept the new one only once we have that many AND every
-        observation in the window lies within `reloc_debounce_trans_thresh` of the
-        window's geometric center.
-
-        Distance is measured against the geometric center (mean) of the window, not
-        the first point, so the threshold is symmetric about the cluster. Rotation
-        is not checked (max vx 0.3, ~5 s trajectory makes translation sufficient).
-        A genuine sustained shift (e.g. VIO restart) re-acquires once the stale
-        observations age out of the bounded window.
-
-        Returns True if the observation should be committed.
-        """
-        if timestamp_ns not in self.pose_graph_used_pose:
-            # No odom counterpart to compare against; fall back to accepting.
-            self.get_logger().warning(f"[reloc-debounce] ts={timestamp_ns} no odom counterpart, accepting without check")
-            return True
-
-        camera_in_odom_world = self.pose_graph_used_pose[timestamp_ns]
-        observed_T = camera_in_odom_world @ np.linalg.inv(pose_in_world)
-        self.reloc_pending.append((timestamp_ns, observed_T[:3, 3].copy()))
-
-        # Warm up by frame count: HOLD (reject, leaving T_from_map_to_odom None so
-        # no target is published and the robot stays stopped) until we have
-        # accumulated `reloc_min_obs` successful PnP observations. The deque is
-        # bounded to that length, so it always holds the trailing N. This trades a
-        # few frames of standstill on (re)acquisition for not driving on a single,
-        # possibly-wrong DINO pick. Cold start and post-VIO-drop re-acquisition use
-        # the same gate.
-        if len(self.reloc_pending) < self.reloc_min_obs:
-            self.get_logger().info(
-                f"[reloc-debounce] ts={timestamp_ns} warming up, "
-                f"{len(self.reloc_pending)}/{self.reloc_min_obs} obs, "
-                f"holding (no target) until enough frames agree")
-            return False
-
-        translations = np.array([t for _, t in self.reloc_pending])
-        center = translations.mean(axis=0)
-        max_dist = np.linalg.norm(translations - center, axis=1).max()
-
-        if max_dist > self.reloc_debounce_trans_thresh:
-            self.get_logger().warning(
-                f"[reloc-debounce] ts={timestamp_ns} REJECTED, max dist from center "
-                f"{max_dist:.3f}m > {self.reloc_debounce_trans_thresh}m "
-                f"({len(self.reloc_pending)} obs)")
-            return False
-
-        self.get_logger().info(
-            f"[reloc-debounce] ts={timestamp_ns} ACCEPTED, max dist from center "
-            f"{max_dist:.3f}m ({len(self.reloc_pending)} obs)")
-        return True
 
     def save_relocalization_poses(self):
         if self._save_completed:
