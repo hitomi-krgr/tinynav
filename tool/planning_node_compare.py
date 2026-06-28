@@ -165,7 +165,7 @@ class Scene:
     global_path_pts: list = field(default_factory=list)  # (x, y) waypoints (world)
     robot: tuple = (0.0, 0.0, 0.0)                        # (x, y, yaw)
     target: Optional[np.ndarray] = None
-    occ2d: Optional[np.ndarray] = None                    # map occupancy (for depth/plot)
+    occ2d: Optional[np.ndarray] = None                    # map occupancy (for depth/plot/collision)
     occ_ox: float = 0.0
     occ_oy: float = 0.0
     occ_res: float = 0.1
@@ -244,11 +244,26 @@ def load_map(map_dir):
     with open(os.path.join(map_dir, "pois.json")) as f:
         pois_raw = json.load(f)
     pois = {v["name"]: np.array(v["position"], dtype=np.float64) for v in pois_raw.values()}
+    oz, res = float(meta[2]), float(meta[3])
+    # Collapse occupancy only over the robot's working z-band, NOT all z. Collapsing
+    # every layer turns floor / ceiling / overhead structure into 2D walls and makes
+    # corners far tighter than the robot actually sees -> sim wedges where real drives.
+    # The band is centred on the SDF-seed height (the recorded mapping pose z, i.e. where
+    # the robot physically was during collection), not the POI height (targets may sit high).
+    work_z = oz
+    pp = os.path.join(map_dir, "poses.npy")
+    if os.path.exists(pp):
+        pd = np.load(pp, allow_pickle=True).item()
+        if pd:
+            work_z = float(np.median([np.asarray(v)[2, 3] for v in pd.values()]))
+    z_world = oz + (np.arange(occ.shape[2]) + 0.5) * res
+    band = (z_world >= work_z - 0.7) & (z_world <= work_z + 0.3)
+    occ2d = (occ[:, :, band] == 2).any(axis=2) if band.any() else (occ == 2).any(axis=2)
     return {
         "occ": occ, "sdf": sdf,
-        "ox": float(meta[0]), "oy": float(meta[1]), "oz": float(meta[2]), "res": float(meta[3]),
+        "ox": float(meta[0]), "oy": float(meta[1]), "oz": oz, "res": res,
         "pois": pois,
-        "occ2d": (occ == 2).any(axis=2),   # any cell occupied in any z layer -> wall column
+        "occ2d": occ2d,
     }
 
 
@@ -265,6 +280,28 @@ def load_start_from_poses(map_dir):
         return None
     pose0 = np.asarray(d[min(d.keys())])
     return tuple(float(v) for v in pose0[:3, 3])
+
+
+def repair_path(path_w, occ2d, ox, oy, res, push=0.2):
+    """Push global-path points that sit in (or within `push` of) an obstacle out to
+    the nearest cell with >= push clearance."""
+    from scipy.ndimage import distance_transform_edt
+    clear = distance_transform_edt(~occ2d) * res
+    nx, ny = occ2d.shape
+    R = int(push / res) + 3
+    out = []
+    for (x, y) in path_w:
+        ix, iy = int((x - ox) / res), int((y - oy) / res)
+        if 0 <= ix < nx and 0 <= iy < ny and clear[ix, iy] >= push:
+            out.append((x, y)); continue
+        best, bd = None, 1e18
+        for a in range(-R, R + 1):
+            for b in range(-R, R + 1):
+                xi, yi = ix + a, iy + b
+                if 0 <= xi < nx and 0 <= yi < ny and clear[xi, yi] >= push and a * a + b * b < bd:
+                    bd, best = a * a + b * b, (xi, yi)
+        out.append((best[0] * res + ox, best[1] * res + oy) if best else (x, y))
+    return out
 
 
 def map_scene(mapd, names, path_stride=3, start_w=None):
@@ -298,13 +335,17 @@ def map_scene(mapd, names, path_stride=3, start_w=None):
     if path_w[-1] != end_w:
         path_w.append(end_w)
     sw, gw = waypts[0], waypts[-1]
-    yaw0 = float(np.arctan2(path_w[1][1] - sw[1], path_w[1][0] - sw[0])) if len(path_w) >= 2 else 0.0
+    occ2d = mapd["occ2d"]
+    # Push global-path points out of obstacles to >= 0.2 m clearance.
+    path_w = repair_path(path_w, occ2d, ox, oy, res, push=0.2)
+    # Start facing along the (repaired) global path's first segment.
+    yaw0 = float(np.arctan2(path_w[1][1] - path_w[0][1], path_w[1][0] - path_w[0][0])) if len(path_w) >= 2 else 0.0
     tag = ("start_" if start_w is not None else "") + "_".join(names)
     return Scene(name="map_" + tag,
                  global_path_pts=path_w,
                  robot=(float(sw[0]), float(sw[1]), yaw0),
                  target=np.array([gw[0], gw[1], gw[2]], dtype=np.float64),
-                 occ2d=mapd["occ2d"], occ_ox=ox, occ_oy=oy, occ_res=res)
+                 occ2d=occ2d, occ_ox=ox, occ_oy=oy, occ_res=res)
 
 
 class ProgressTracker:
@@ -504,9 +545,57 @@ def run_route(node, ctrl, driver, executor, scene, fp):
     final_goal = global_path[-1]
     tracker = ProgressTracker(global_path)
 
+    # --- openness prior (emulates map_node's static obstacle-distance hint) ---
+    # When PNC_OPENNESS_SAFETY is set, modulate node.robot.safety_radius per-frame
+    # from the static obstacle EDT at the robot: open -> generous, narrow -> tight.
+    _openness = None
+    if os.environ.get("PNC_OPENNESS_SAFETY"):
+        from scipy.ndimage import distance_transform_edt as _edt
+        _openness = _edt(~scene.occ2d) * scene.occ_res
+        _base_safety = float(node.robot.safety_radius)
+
+    def _openness_at(px, py):
+        ix = int((px - scene.occ_ox) / scene.occ_res)
+        iy = int((py - scene.occ_oy) / scene.occ_res)
+        if 0 <= ix < _openness.shape[0] and 0 <= iy < _openness.shape[1]:
+            return float(_openness[ix, iy])
+        return None
+
+    def _localtarget_and_openness(px, py, lookahead_max=TARGET_LOOKAHEAD_M,
+                                  min_lookahead=1.0, turn_thresh=np.deg2rad(45.0), smooth_m=0.4):
+        # Mirror of map_node: local target = furthest path point reachable before the
+        # heading turns past turn_thresh (a corner) or lookahead_max, never closer than
+        # min_lookahead. openness = MIN obstacle-ESDF over robot -> local-target.
+        gp = global_path[:, :2]
+        n = len(gp)
+        i0 = int(np.argmin(np.linalg.norm(gp - np.array([px, py]), axis=1)))
+        cum = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(gp, axis=0), axis=1))))
+
+        def sdir(i):
+            j = i
+            while j < n - 1 and (cum[j] - cum[i]) < smooth_m:
+                j += 1
+            dvec = gp[j] - gp[i]; L = float(np.linalg.norm(dvec))
+            return dvec / L if L > 1e-6 else None
+
+        entry = sdir(i0)
+        li = i0
+        for k in range(i0 + 1, n):
+            if cum[k] - cum[i0] >= lookahead_max:
+                li = k; break
+            dk = sdir(k)
+            if (cum[k] - cum[i0]) >= min_lookahead and entry is not None and dk is not None:
+                turn = abs(np.arctan2(dk[0] * entry[1] - dk[1] * entry[0], float(dk @ entry)))
+                if turn >= turn_thresh:
+                    li = k; break
+            li = k
+        vals = [v for v in (_openness_at(p[0], p[1]) for p in gp[i0:li + 1]) if v is not None]
+        return gp[li], (min(vals) if vals else None)
+
     cx, cy, yaw = scene.robot
     samples = [(cx, cy)]
-    collided = None
+    collisions = []          # all collision points along the route (do not stop on hit)
+    _in_collision = False
 
     def cam_pose():
         R = yaw_to_R_wc(yaw)
@@ -530,8 +619,15 @@ def run_route(node, ctrl, driver, executor, scene, fp):
         # so the controller never chases a stale one.
         is_plan_tick = (k % PLAN_EVERY_TICKS == 0)
         if is_plan_tick:
+            target_xy = tracker.target(cx, cy)[:2]
+            if _openness is not None:
+                lt, o = _localtarget_and_openness(cx, cy)
+                target_xy = lt  # publish localtarget in place of the fixed lookahead
+                if o is not None:
+                    b = _base_safety
+                    node.robot.safety_radius = min(b, max(b * 0.75, (o - node.robot.width) * 0.75))
             driver.latest_path = None
-            driver.publish_world(cam_pos, R, tracker.target(cx, cy)[:2], global_path)
+            driver.publish_world(cam_pos, R, target_xy, global_path)
         else:
             driver.publish_camera_odom(cam_pos, R)
         for _ in range(SPIN_TRIES):
@@ -549,20 +645,17 @@ def run_route(node, ctrl, driver, executor, scene, fp):
         cy += vx * np.sin(yaw) * CTRL_DT
         samples.append((cx, cy))
 
-        # Collision: footprint overlaps a real occupied cell -> mark + stop.
-        if footprint_collides(cx, cy, yaw, fp, scene.occ2d, scene.occ_ox, scene.occ_oy, scene.occ_res):
-            collided = (cx, cy)
+        # Collision: footprint overlaps a real occupied cell. Record it (rising edge)
+        # but KEEP GOING -- we want the full route and every collision, not a stop.
+        hit = footprint_collides(cx, cy, yaw, fp, scene.occ2d, scene.occ_ox, scene.occ_oy, scene.occ_res)
+        if hit and not _in_collision:
+            collisions.append((cx, cy))
             if os.environ.get("PNC_DEBUG"):
-                # Did the PLANNER's published local path also enter the wall (planner
-                # fault / perception), or did the controller deviate into it?
                 p_in = points_in_occ(driver.latest_path, scene.occ2d, scene.occ_ox, scene.occ_oy, scene.occ_res)
-                nm = sys.modules[type(node).__module__]
-                mask = nm.build_obstacle_map(node.occupancy_grid, node.origin, node.resolution,
-                                             robot_z=cam_pose()[0][2], config=node.obstacle_config)
-                print(f"    COLLISION @({cx:.2f},{cy:.2f}) step={k} | "
-                      f"published-path pts in wall={p_in}/{0 if driver.latest_path is None else len(driver.latest_path)} | "
-                      f"planner obstacle_mask cells={int(mask.sum())}", flush=True)
-            break
+                print(f"    COLLISION #{len(collisions)} @({cx:.2f},{cy:.2f}) step={k} | "
+                      f"published-path pts in wall={p_in}/{0 if driver.latest_path is None else len(driver.latest_path)}",
+                      flush=True)
+        _in_collision = hit
 
         if os.environ.get("PNC_DEBUG") and k % 24 == 0:
             p_in = points_in_occ(driver.latest_path, scene.occ2d, scene.occ_ox, scene.occ_oy, scene.occ_res)
@@ -571,7 +664,8 @@ def run_route(node, ctrl, driver, executor, scene, fp):
                   f"pos=({cx:.2f},{cy:.2f}) yaw={yaw:.2f} vx={vx:.3f} wz={wz:.3f} "
                   f"herr={herr} pathInWall={p_in}", flush=True)
 
-    return {"traj": np.array(samples), "collided": collided}
+    return {"traj": np.array(samples), "collisions": collisions,
+            "collided": collisions[0] if collisions else None}
 
 
 def lateral_deviation(traj, global_path):
@@ -606,12 +700,13 @@ def plot_route(scene, results, labels, out_path):
     for i, (label, res) in enumerate(zip(labels, results)):
         c, st = COLORS[i % len(COLORS)], STYLES[i % len(STYLES)]
         traj = res["traj"]
-        tag = "  COLLIDED" if res["collided"] is not None else ""
+        cols = res.get("collisions", [])
+        tag = f"  {len(cols)} hits" if cols else ""
         ax.plot(traj[:, 0], traj[:, 1], color=c, linestyle=st, lw=2.6, alpha=0.9,
                 label=f"{label} ({len(traj) - 1} steps){tag}")
         ax.plot(traj[-1, 0], traj[-1, 1], marker=".", color=c, ms=14)
-        if res["collided"] is not None:
-            ax.plot(res["collided"][0], res["collided"][1], "X", color=c, ms=18, mew=3)
+        for (hx, hy) in cols:
+            ax.plot(hx, hy, "X", color=c, ms=14, mew=2)
 
     ax.set_title(scene.name)
     ax.set_aspect("equal")
@@ -708,7 +803,7 @@ def main():
                 res = run_route(node, ctrl, driver, executor, scene, fp)
                 results[si][fi] = res
                 traj = res["traj"]
-                tag = " COLLIDED" if res["collided"] is not None else ""
+                tag = f" {len(res['collisions'])}hits" if res["collisions"] else ""
                 mdev, fdev = lateral_deviation(traj, scene.global_path_pts)
                 bias = getattr(ctrl, "_yaw_bias_est", float("nan"))
                 print(f"  {scene.name}: {len(traj) - 1} steps, "
