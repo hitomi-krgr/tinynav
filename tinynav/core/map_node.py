@@ -223,6 +223,8 @@ class MapNode(Node):
         self.pose_graph_used_pose = {}
         self.relative_pose_constraint = []
         self.last_keyframe_timestamp = None
+        # timestamp -> DINOv2 embedding, populated as keyframes arrive (see keyframe_mapping).
+        self._embedding_cache = {}
 
         self.loop_similarity_threshold = 0.90
         self.loop_top_k = 1
@@ -287,6 +289,14 @@ class MapNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self._save_completed = False
+
+        # Persistent event loop reused across all TRT inferences. asyncio.run()
+        # builds and tears down a fresh loop on every call, which is pure overhead
+        # at keyframe rate.
+        self._loop = asyncio.new_event_loop()
+
+    def _run(self, coro):
+        return self._loop.run_until_complete(coro)
 
     def pois_callback(self, msg: String):
         self.get_logger().info("Received POIs from planner: " + msg.data)
@@ -380,6 +390,7 @@ class MapNode(Node):
         self.pose_graph_used_pose = {}
         self.relative_pose_constraint = []
         self.last_keyframe_timestamp = None
+        self._embedding_cache = {}
 
     def localization_stop_callback(self, msg: Bool):
         if msg.data:
@@ -402,11 +413,20 @@ class MapNode(Node):
                 self.localization_data_saved_pub.publish(save_finished_msg)
 
     def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
-        self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg)
+        if self.K is None:
+            return
         image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
+        # Compute SuperPoint features and DINOv2 embedding ONCE here and reuse them
+        # in both mapping and relocalization. Previously each was recomputed inside
+        # keyframe_mapping and keyframe_relocalization, doubling the TRT inference
+        # cost of every keyframe.
+        features = self._run(self.super_point_extractor.infer(image))
+        embedding = self.get_embeddings(image)
+
+        self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg, image, features, embedding)
 
         keyframe_image_timestamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
-        success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
+        success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image, features, embedding)
         if success:
             self.compute_transform_from_map_to_odom()
 
@@ -417,11 +437,11 @@ class MapNode(Node):
             # compute the coordinate transform from the map pose to the keyframe pose
             # publish the nav path from the map pose to the keyframe pose with the cost map
 
-    def keyframe_mapping_with_timer(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+    def keyframe_mapping_with_timer(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, image, features, embedding):
         with Timer(name="Mapping Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
-            self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg)
+            self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg, image, features, embedding)
 
-    def keyframe_mapping(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+    def keyframe_mapping(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, image, features, embedding):
         if self.K is None:
             return
         keyframe_image_timestamp = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
@@ -431,14 +451,14 @@ class MapNode(Node):
         assert keyframe_image_timestamp == depth_timestamp
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
         odom, _ = msg2np(keyframe_odom_msg)
-        image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
         rgb_image_place_holder = einops.repeat(image, "h w -> h w c", c = 3)
 
         self.nav_temp_db.set_entry(keyframe_image_timestamp, depth = depth, infra1_image = image, rgb_image = rgb_image_place_holder)
-        embedding = self.get_embeddings(image)
         self.nav_temp_db.set_entry(keyframe_image_timestamp, embedding = embedding)
-        features = asyncio.run(self.super_point_extractor.infer(image))
         self.nav_temp_db.set_entry(keyframe_image_timestamp, features = features)
+        # In-memory embedding cache so find_loop does not re-read every keyframe's
+        # embedding from the DB on each call (was O(N) DB reads per keyframe -> O(N^2)).
+        self._embedding_cache[keyframe_image_timestamp] = embedding
 
         if len(self.odom) == 0 and self.last_keyframe_timestamp is None:
             self.odom[keyframe_odom_timestamp] = odom
@@ -450,9 +470,9 @@ class MapNode(Node):
             self.pose_graph_used_pose[keyframe_image_timestamp] = odom
             self.odom[keyframe_image_timestamp] = odom
             def find_loop_and_pose_graph(timestamp):
-                    target_embedding = self.nav_temp_db.get_embedding(timestamp)
+                    target_embedding = self._embedding_cache[timestamp]
                     valid_timestamp = [t for t in self.pose_graph_used_pose.keys() if t + 10 * 1e9 < timestamp]
-                    valid_embeddings = np.array([self.nav_temp_db.get_embedding(t) for t in valid_timestamp])
+                    valid_embeddings = np.array([self._embedding_cache[t] for t in valid_timestamp])
 
                     idx_to_timestamp = {i:t for i, t in enumerate(valid_timestamp)}
                     with Timer(name = "find loop", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
@@ -478,10 +498,10 @@ class MapNode(Node):
 
     def get_embeddings(self, image: np.ndarray) -> np.ndarray:
         # shape: (1, 768)
-        return asyncio.run(self.dinov2_model.infer(image))
+        return self._run(self.dinov2_model.infer(image))
 
     def match_keypoints(self, feats0:dict, feats1:dict, image_shape = np.array([848, 480], dtype = np.int64)) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        match_result = asyncio.run(self.light_glue_matcher.infer(feats0["kpts"], feats1["kpts"], feats0['descps'], feats1['descps'], feats0['mask'], feats1['mask'], image_shape, image_shape))
+        match_result = self._run(self.light_glue_matcher.infer(feats0["kpts"], feats1["kpts"], feats0['descps'], feats1['descps'], feats0['mask'], feats1['mask'], image_shape, image_shape))
         match_indices = match_result["match_indices"][0]
         valid_mask = match_indices != -1
         keypoints0 = feats0["kpts"][0][valid_mask]
@@ -512,10 +532,9 @@ class MapNode(Node):
             path_msg.poses.append(pose)
         self.pose_graph_trajectory_pub.publish(path_msg)
 
-    def relocalize_with_depth(self, keyframe: np.ndarray, keyframe_features: dict, K: np.ndarray | None) -> tuple[bool, np.ndarray, float]:
+    def relocalize_with_depth(self, keyframe: np.ndarray, keyframe_features: dict, K: np.ndarray | None, query_embedding: np.ndarray) -> tuple[bool, np.ndarray, float]:
         if K is None:
             return False, np.eye(4), -np.inf
-        query_embedding = self.get_embeddings(keyframe)
         query_embedding_normed = query_embedding / np.linalg.norm(query_embedding)
 
         idx_and_similarity_array = find_loop(query_embedding_normed, self.map_embeddings, self.relocalization_threshold, self.relocalization_loop_top_k)
@@ -552,28 +571,19 @@ class MapNode(Node):
         return False, np.eye(4), -np.inf
 
     def keypoint_with_depth_to_3d(self, keypoints:np.ndarray, depth:np.ndarray, pose_from_camera_to_world:np.ndarray, K:np.ndarray):
-        point_in_camera = []
-        inliers = []
         fx = K[0, 0]
         fy = K[1, 1]
         cx = K[0, 2]
         cy = K[1, 2]
-        for kp in keypoints:
-            u = int(kp[0])
-            v = int(kp[1])
-            Z = depth[v, u]
-            if Z > 0 and Z < 50:
-                X = (u - cx) * Z / fx
-                Y = (v - cy) * Z / fy
-                inliers.append(True)
-            else:
-                X = 0
-                Y = 0
-                inliers.append(False)
-            point_in_camera.append(np.array([X, Y, Z]))
+        # Vectorized projection of all keypoints (was a per-keypoint Python loop).
+        u = keypoints[:, 0].astype(np.int64)
+        v = keypoints[:, 1].astype(np.int64)
+        Z = depth[v, u]
+        inliers = (Z > 0) & (Z < 50)
+        X = np.where(inliers, (u - cx) * Z / fx, 0.0)
+        Y = np.where(inliers, (v - cy) * Z / fy, 0.0)
         # shape: (N, 3)
-        point_in_camera = np.array(point_in_camera)
-        inliers = np.array(inliers)
+        point_in_camera = np.stack([X, Y, Z], axis=1)
         rotation = pose_from_camera_to_world[:3, :3]
         translation = pose_from_camera_to_world[:3,3]
 
@@ -581,9 +591,8 @@ class MapNode(Node):
         return point_in_world, inliers
 
     @Timer(name="Relocalization loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms")
-    def keyframe_relocalization(self, timestamp, image:np.ndarray) -> tuple[bool, np.ndarray]:
-        features = asyncio.run(self.super_point_extractor.infer(image))
-        res, pose_in_camera, pose_cov_weight = self.relocalize_with_depth(image, features, self.K)
+    def keyframe_relocalization(self, timestamp, image:np.ndarray, features:dict, embedding:np.ndarray) -> tuple[bool, np.ndarray]:
+        res, pose_in_camera, pose_cov_weight = self.relocalize_with_depth(image, features, self.K, embedding)
         if res:
             # publish the relocalization pose for debug
             pose_in_world = np.linalg.inv(pose_in_camera)

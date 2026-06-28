@@ -36,6 +36,8 @@ class CmdVelControlNode(Node):
         self.last_path_time = 0.0
         self.pose = None
         self.path = None
+        self._path_xy = None          # (N,2) cached path XY, updated in path_callback
+        self._path_pose_yaw = None    # (N,) cached per-pose forward heading
 
         self.cmd_rate_hz = 12.0
         # Minima; actual stale thresholds are scaled by observed planner period.
@@ -165,16 +167,12 @@ class CmdVelControlNode(Node):
     def _path_intended_yaw(self):
         """World heading the plan intends here: forward axis of the published trajectory
         pose nearest the control center. The reference for isolating open-loop drift."""
-        if self.pose is None or self.path is None or len(self.path.poses) == 0:
+        if self.pose is None or self.path is None or self._path_xy is None or len(self._path_xy) == 0:
             return None
         ctrl_xy = (self._pose_to_T(self.pose.pose) @ self.T_camera_to_control)[:2, 3]
-        best_i, best_d = 0, float('inf')
-        for i, ps in enumerate(self.path.poses):
-            d = (ps.pose.position.x - ctrl_xy[0]) ** 2 + (ps.pose.position.y - ctrl_xy[1]) ** 2
-            if d < best_d:
-                best_d, best_i = d, i
-        fwd = self._pose_to_T(self.path.poses[best_i])[:3, :3] @ np.array([0.0, 0.0, 1.0])
-        return float(np.arctan2(fwd[1], fwd[0]))
+        d2 = np.sum((self._path_xy - ctrl_xy) ** 2, axis=1)
+        best_i = int(np.argmin(d2))
+        return float(self._path_pose_yaw[best_i])
 
     def cmd_timer_callback(self):
         now = time.monotonic()
@@ -275,6 +273,20 @@ class CmdVelControlNode(Node):
         if len(msg.poses) < 2:
             return
         self.path = msg
+
+        # Cache path XY and per-pose forward heading so _path_intended_yaw (called at
+        # cmd_rate_hz) is a vectorized argmin instead of a Python loop over poses with
+        # a scipy Rotation build per pose. Forward (optical +z) heading from quaternion:
+        #   fwd_x = 2(xz + wy), fwd_y = 2(yz - wx).
+        px = np.array([p.pose.position.x for p in msg.poses])
+        py = np.array([p.pose.position.y for p in msg.poses])
+        qx = np.array([p.pose.orientation.x for p in msg.poses])
+        qy = np.array([p.pose.orientation.y for p in msg.poses])
+        qz = np.array([p.pose.orientation.z for p in msg.poses])
+        qw = np.array([p.pose.orientation.w for p in msg.poses])
+        self._path_xy = np.stack([px, py], axis=1)
+        self._path_pose_yaw = np.arctan2(2.0 * (qy * qz - qw * qx),
+                                         2.0 * (qx * qz + qw * qy))
 
         ros_now = self.get_clock().now().to_msg()
         self.last_path_time = ros_now.sec + ros_now.nanosec * 1e-9

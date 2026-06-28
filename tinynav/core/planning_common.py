@@ -418,6 +418,12 @@ class PlanningNodeBase(Node):
         self.z_grid_drop = -(self.obstacle_config.robot_z_top + self.obstacle_config.robot_z_bottom) / 2
         self.origin = np.array(self.grid_shape) * self.resolution / -2.
         self.step = 10
+        # Visualization is expensive (full-grid point clouds, colormaps) and not
+        # needed every cycle. Publish it every Nth callback; the control path
+        # (obstacle map, scoring, trajectory) still runs every cycle.
+        self.declare_parameter('vis_every_n', 5)
+        self.vis_every_n = int(self.get_parameter('vis_every_n').value)
+        self._vis_counter = 0
         self.occupancy_grid = np.zeros(self.grid_shape)
         self.K = None
         self.baseline = None
@@ -616,6 +622,8 @@ class PlanningNodeBase(Node):
     def sync_callback(self, depth_msg, odom_msg):
         if self.K is None:
             return
+        self._vis_counter += 1
+        vis_now = (self.vis_every_n > 0) and (self._vis_counter % self.vis_every_n == 0)
         with Timer(name='preprocess', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
             stamp = Time.from_msg(odom_msg.header.stamp).nanoseconds / 1e9
@@ -644,7 +652,8 @@ class PlanningNodeBase(Node):
             self.occupancy_grid += new_occ
             self.occupancy_grid = np.clip(self.occupancy_grid, -0.2, 0.2)
 
-            self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
+            if vis_now:
+                self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             obstacle_mask = build_obstacle_map(
@@ -653,12 +662,13 @@ class PlanningNodeBase(Node):
             )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
 
-        with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
-            self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
-            self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
-            self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
-            self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
-            self.publish_footprint(T, depth_msg.header.stamp)
+        if vis_now:
+            with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+                self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
+                self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
+                self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
+                self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
+                self.publish_footprint(T, depth_msg.header.stamp)
 
         with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             init_p = self.camera_to_robot_center(T)
