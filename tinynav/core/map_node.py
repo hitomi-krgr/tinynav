@@ -828,7 +828,7 @@ class MapNode(Node):
 
                 # Static openness prior: min obstacle-distance over the robot -> local
                 # target segment, for the planner to size safety.
-                self._ensure_openness_map(band_center_z=float(pose_in_map[2, 3]))
+                self._ensure_openness_map()
                 openness = self._path_openness(paths_in_map[start_i:local_i + 1], lookahead_m=float('inf'))
                 if np.isfinite(openness):
                     self.path_openness_pub.publish(Float32(data=float(openness)))
@@ -837,18 +837,20 @@ class MapNode(Node):
         else:
             logging.info("No path found in map")
 
-    def _ensure_openness_map(self, band_center_z: float):
-        """Build a 2D obstacle-distance field (m) by collapsing occupied cells over
-        the robot's z-band, then EDT. Reflects static corridor width. Recomputed
-        whenever the occupancy_map is reloaded (map switch / handoff)."""
+    def _ensure_openness_map(self):
+        """Build a 2D obstacle-distance field (m) by collapsing occupied cells over a
+        z-band around the working height (median z of the recorded mapping poses) +-
+        0.4 m, then EDT. Reflects static corridor width. Recomputed whenever the
+        occupancy_map is reloaded (map switch / handoff)."""
         if self._openness2d is not None and self._openness_map_id == id(self.occupancy_map):
             return
         self._openness_map_id = id(self.occupancy_map)
         origin = self.occupancy_map_meta[:3]
         res = float(self.occupancy_map_meta[3])
+        work_z = float(np.median([np.asarray(p)[2, 3] for p in self.map_poses.values()]))
         z_dim = self.occupancy_map.shape[2]
         z_world = origin[2] + (np.arange(z_dim) + 0.5) * res
-        band = (z_world >= band_center_z - 0.7) & (z_world <= band_center_z + 0.3)
+        band = (z_world >= work_z - 0.4) & (z_world <= work_z + 0.4)
         if band.any():
             occ2d = (self.occupancy_map[:, :, band] == 2).any(axis=2)
         else:
