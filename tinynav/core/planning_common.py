@@ -20,7 +20,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import Image, CameraInfo, PointField, PointCloud2, PointCloud
 from nav_msgs.msg import Path, Odometry, OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Point32
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float32
 from cv_bridge import CvBridge
 import sensor_msgs_py.point_cloud2 as pc2
 from codetiming import Timer
@@ -71,7 +71,7 @@ B2_CONFIG = RobotConfig(
     length=0.8, width=0.3,
     camera_x=0.5, camera_y=0.0,
     control_x=0.0, control_y=0.0,
-    safety_radius=0.075,
+    safety_radius=0.1,
 )
 
 
@@ -431,6 +431,12 @@ class PlanningNodeBase(Node):
         self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
         self.target_pose = None
 
+        # Openness prior from map_node: min static obstacle-ESDF (m) over the upcoming
+        # global segment. Used to modulate safety_radius: tight in pinches, base in open.
+        self._safety_base = float(self.robot.safety_radius)
+        self._nav_openness = None
+        self.create_subscription(Float32, '/mapping/path_openness', self.path_openness_callback, 10)
+
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
         self._setup_extras()
@@ -454,6 +460,13 @@ class PlanningNodeBase(Node):
 
     def target_pose_callback(self, msg):
         self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+
+    def path_openness_callback(self, msg):
+        # Static openness prior (m) -> safety_radius. Tighten toward narrow corridors:
+        # safety = clip((openness - robot.width) * 0.75, base*0.75, base).
+        self._nav_openness = float(msg.data)
+        b = self._safety_base
+        self.robot.safety_radius = min(b, max(b * 0.75, (self._nav_openness - self.robot.width) * 0.75))
 
     def info_callback(self, msg):
         if self.K is None:
