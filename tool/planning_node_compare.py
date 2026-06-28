@@ -257,7 +257,7 @@ def load_map(map_dir):
         if pd:
             work_z = float(np.median([np.asarray(v)[2, 3] for v in pd.values()]))
     z_world = oz + (np.arange(occ.shape[2]) + 0.5) * res
-    band = (z_world >= work_z - 0.7) & (z_world <= work_z + 0.3)
+    band = (z_world >= work_z - 0.4) & (z_world <= work_z + 0.4)
     occ2d = (occ[:, :, band] == 2).any(axis=2) if band.any() else (occ == 2).any(axis=2)
     return {
         "occ": occ, "sdf": sdf,
