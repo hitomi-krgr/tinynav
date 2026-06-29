@@ -441,6 +441,8 @@ class PlanningNodeBase(Node):
         # global segment. Used to modulate safety_radius: tight in pinches, base in open.
         self._safety_base = float(self.robot.safety_radius)
         self._nav_openness = None
+        self._nav_openness_stamp_ns = None  # node-clock ns when openness was last received
+        self._openness_ttl_ns = int(2.0e9)  # openness older than this -> fall back to base
         self.create_subscription(Float32, '/mapping/path_openness', self.path_openness_callback, 10)
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
@@ -468,11 +470,22 @@ class PlanningNodeBase(Node):
         self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
 
     def path_openness_callback(self, msg):
-        # Static openness prior (m) -> safety_radius. Tighten toward narrow corridors:
-        # safety = clip((openness - robot.width) * 0.75, base*0.75, base).
+        # Just record the prior + arrival time. The effective safety_radius is derived
+        # per planning cycle (see _effective_safety_radius) so it self-heals back to
+        # base when the openness stream stops, instead of freezing at the last value.
         self._nav_openness = float(msg.data)
+        self._nav_openness_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _effective_safety_radius(self):
+        # Static openness prior (m) -> safety_radius. Tighten toward narrow corridors:
+        # safety = clip((openness - robot.width) * 0.75, base*0.75, base). Falls back to
+        # base when no openness has been received or the last one is stale.
         b = self._safety_base
-        self.robot.safety_radius = min(b, max(b * 0.75, (self._nav_openness - self.robot.width) * 0.75))
+        if self._nav_openness is None or self._nav_openness_stamp_ns is None:
+            return b
+        if self.get_clock().now().nanoseconds - self._nav_openness_stamp_ns > self._openness_ttl_ns:
+            return b
+        return min(b, max(b * 0.75, (self._nav_openness - self.robot.width) * 0.75))
 
     def info_callback(self, msg):
         if self.K is None:
@@ -682,7 +695,8 @@ class PlanningNodeBase(Node):
 
         with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_len, rear_len, half_w = self.robot.footprint_from_control()
-            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, self.robot.safety_radius, front_len, rear_len, half_w)
+            safety_radius = self._effective_safety_radius()
+            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, safety_radius, front_len, rear_len, half_w)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
