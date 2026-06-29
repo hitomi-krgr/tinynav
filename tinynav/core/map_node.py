@@ -19,7 +19,6 @@ import cv2
 from codetiming import Timer
 import argparse
 
-from tinynav.tinynav_cpp_bind import pose_graph_solve
 from tinynav.core.models_trt import LightGlueTRT, Dinov2TRT, SuperPointTRT
 import logging
 import asyncio
@@ -248,6 +247,17 @@ class MapNode(Node):
         self.relocalization_pose_weights = {}
         self.failed_relocalizations = []
 
+        # Lock-once relocalization: relocalize every keyframe only until we have a
+        # consistent fix, then freeze T_from_map_to_odom and ride odom from there.
+        # DINOv2 retrieval can match a wrong-but-similar place on a single frame, so
+        # we don't trust the first success -- we require the most recent few
+        # observations of T_from_map_to_odom to agree spatially before locking.
+        # Sliding window (not fill-then-clear) so a stray bad observation can't keep
+        # resetting the count.
+        self.reloc_lock_window = 3          # recent observations that must agree
+        self.reloc_lock_tol = 0.3           # meters; max pairwise translation spread
+        self._reloc_obs_window = []         # recent observation_T_from_map_to_odom (4x4)
+
         self.T_from_map_to_odom = None
 
         self.pois = {}
@@ -380,9 +390,12 @@ class MapNode(Node):
         self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg, image, features, embedding)
 
         keyframe_image_timestamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
-        success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image, features, embedding)
-        if success:
-            self.compute_transform_from_map_to_odom()
+        # Once locked, T_from_map_to_odom is frozen and we ride odom -- skip
+        # relocalization entirely (also saves the TRT match/PnP cost per keyframe).
+        if self.T_from_map_to_odom is None:
+            success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image, features, embedding)
+            if success:
+                self.try_lock_transform_from_map_to_odom(keyframe_image_timestamp_ns)
 
         with Timer(name = "nav path", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             self.try_publish_nav_path(keyframe_image_timestamp_ns)
@@ -592,27 +605,44 @@ class MapNode(Node):
             pass
 
 
-    def compute_transform_from_map_to_odom(self):
-        """
-        Solve the optmization problem.
-        """
-        relative_pose_constraint = []
-        optimized_parameters = {
-            0 : np.eye(4) if self.T_from_map_to_odom is None else self.T_from_map_to_odom,
-            1 : np.eye(4),
-        }
-        constant_pose_index_dict = { 1: True }
-        for timestamp, pose in self.relocalization_poses.items():
-            if timestamp in self.pose_graph_used_pose:
-                camera_in_map_world = pose
-                camera_in_odom_world = self.pose_graph_used_pose[timestamp]
-                observation_T_from_map_to_odom =  camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
-                weight = self.relocalization_pose_weights[timestamp]
+    def try_lock_transform_from_map_to_odom(self, timestamp: int):
+        """Lock T_from_map_to_odom from a single consistent burst of relocalizations.
 
-                relative_pose_constraint.append((0, 1, observation_T_from_map_to_odom, weight * np.array([10.0, 10.0, 10.0]), weight * np.array([10.0, 10.0, 10.0])))
-        relative_pose_constraint = relative_pose_constraint[-100:]
-        optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
-        self.T_from_map_to_odom = optimized_parameters[0]
+        Each successful relocalization gives one observation of the (constant)
+        map->odom transform. DINOv2 retrieval can occasionally match a wrong place,
+        so we don't trust one observation: we keep a sliding window of the most
+        recent few and only lock once they all agree spatially (pairwise translation
+        spread <= reloc_lock_tol). Once locked we never recompute -- the caller stops
+        relocalizing and rides odom.
+        """
+        if timestamp not in self.pose_graph_used_pose:
+            return
+        camera_in_map_world = self.relocalization_poses[timestamp]
+        camera_in_odom_world = self.pose_graph_used_pose[timestamp]
+        observation_T_from_map_to_odom = camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
+
+        self._reloc_obs_window.append(observation_T_from_map_to_odom)
+        self._reloc_obs_window = self._reloc_obs_window[-self.reloc_lock_window:]
+        if len(self._reloc_obs_window) < self.reloc_lock_window:
+            return
+
+        translations = np.array([T[:3, 3] for T in self._reloc_obs_window])
+        spread = float(np.max([
+            np.linalg.norm(translations[i] - translations[j])
+            for i in range(len(translations))
+            for j in range(i + 1, len(translations))
+        ]))
+        if spread > self.reloc_lock_tol:
+            self.get_logger().info(
+                f"[reloc-lock] {len(self._reloc_obs_window)} obs not consistent yet, "
+                f"spread={spread:.2f}m > tol={self.reloc_lock_tol}m")
+            return
+
+        # Consistent burst -> lock to the most recent observation and freeze.
+        self.T_from_map_to_odom = observation_T_from_map_to_odom
+        self.get_logger().info(
+            f"[reloc-lock] locked T_from_map_to_odom (spread={spread:.2f}m over "
+            f"{self.reloc_lock_window} obs)")
 
     def try_publish_nav_path(self, timestamp: int):
         if self.T_from_map_to_odom is None:
