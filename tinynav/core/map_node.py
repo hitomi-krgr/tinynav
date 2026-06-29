@@ -230,7 +230,6 @@ class MapNode(Node):
         self.loop_top_k = 1
 
         self.relocalization_threshold = 0.85
-        self.relocalization_loop_top_k = 3
 
         os.makedirs(f"{tinynav_db_path}/nav_temp", exist_ok=True)
         self.nav_temp_db = TinyNavDB(f"{tinynav_db_path}/nav_temp", is_scratch=True)
@@ -257,11 +256,6 @@ class MapNode(Node):
         # normal moving/standing-still switch and does NOT count as a dropout.
         self.vio_tracking_states = {"TRACKING", "TRACKING_STATIC"}
         self.vio_was_tracking = False
-
-        # Robust (Huber) IRLS for the map->odom solve: down-weights outlier
-        # observations so a single off observation can't drag T_from_map_to_odom.
-        self.reloc_irls_iterations = 3      # re-weight / re-solve rounds
-        self.reloc_huber_delta = 0.3        # meters; residuals beyond this are down-weighted ~delta/r
 
         self.T_from_map_to_odom = None
 
@@ -537,7 +531,7 @@ class MapNode(Node):
             return False, np.eye(4), -np.inf
         query_embedding_normed = query_embedding / np.linalg.norm(query_embedding)
 
-        idx_and_similarity_array = find_loop(query_embedding_normed, self.map_embeddings, self.relocalization_threshold, self.relocalization_loop_top_k)
+        idx_and_similarity_array = find_loop(query_embedding_normed, self.map_embeddings, self.relocalization_threshold, 1)
         max_similarity = np.max([similarity for _, similarity in idx_and_similarity_array]) if len(idx_and_similarity_array) > 0 else 0
         if len(idx_and_similarity_array) == 0:
             print(f"not enough similar embeddings to relocalize, {len(idx_and_similarity_array)}, max_similarity : {max_similarity}")
@@ -640,57 +634,25 @@ class MapNode(Node):
 
     def compute_transform_from_map_to_odom(self):
         """
-        Solve for T_from_map_to_odom from the relocalization observations.
-
-        Each observation is a noisy measurement of the (near-constant) map->odom
-        transform. We solve it robustly with Huber IRLS: pose_graph_solve is the
-        inner weighted-least-squares step, and between rounds each observation's
-        base weight is scaled by a Huber factor (1 if its translation residual
-        against the current estimate is within reloc_huber_delta, else ~delta/r).
-        This down-weights medium outliers that pass the debounce gate instead of
-        letting them pull the estimate.
+        Solve the optmization problem.
         """
-        # Collect the (observation, base_weight) pairs, most recent 100.
-        observations = []
+        relative_pose_constraint = []
+        optimized_parameters = {
+            0 : np.eye(4) if self.T_from_map_to_odom is None else self.T_from_map_to_odom,
+            1 : np.eye(4),
+        }
+        constant_pose_index_dict = { 1: True }
         for timestamp, pose in self.relocalization_poses.items():
             if timestamp in self.pose_graph_used_pose:
                 camera_in_map_world = pose
                 camera_in_odom_world = self.pose_graph_used_pose[timestamp]
-                observation_T_from_map_to_odom = camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
-                base_weight = self.relocalization_pose_weights[timestamp]
-                observations.append((observation_T_from_map_to_odom, base_weight))
-        observations = observations[-100:]
-        if len(observations) == 0:
-            return
+                observation_T_from_map_to_odom =  camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
+                weight = self.relocalization_pose_weights[timestamp]
 
-        T_estimate = np.eye(4) if self.T_from_map_to_odom is None else self.T_from_map_to_odom
-        constant_pose_index_dict = {1: True}
-        for iteration in range(self.reloc_irls_iterations):
-            relative_pose_constraint = []
-            num_downweighted = 0
-            for observation_T, base_weight in observations:
-                # Translation residual of this observation against the current estimate.
-                residual = np.linalg.norm((np.linalg.inv(T_estimate) @ observation_T)[:3, 3])
-                if residual <= self.reloc_huber_delta:
-                    robust = 1.0
-                else:
-                    robust = self.reloc_huber_delta / residual
-                    num_downweighted += 1
-                w = base_weight * robust * np.array([10.0, 10.0, 10.0])
-                relative_pose_constraint.append((0, 1, observation_T, w, w))
-
-            optimized_parameters = pose_graph_solve(
-                {0: T_estimate, 1: np.eye(4)},
-                relative_pose_constraint,
-                constant_pose_index_dict,
-                max_iteration_num=1000,
-            )
-            T_estimate = optimized_parameters[0]
-            self.get_logger().info(
-                f"[reloc-irls] iter {iteration + 1}/{self.reloc_irls_iterations}, "
-                f"{num_downweighted}/{len(observations)} obs down-weighted (delta={self.reloc_huber_delta}m)")
-
-        self.T_from_map_to_odom = T_estimate
+                relative_pose_constraint.append((0, 1, observation_T_from_map_to_odom, weight * np.array([10.0, 10.0, 10.0]), weight * np.array([10.0, 10.0, 10.0])))
+        relative_pose_constraint = relative_pose_constraint[-100:]
+        optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
+        self.T_from_map_to_odom = optimized_parameters[0]
 
     def try_publish_nav_path(self, timestamp: int):
         if self.T_from_map_to_odom is None:
