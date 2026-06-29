@@ -200,7 +200,6 @@ class MapNode(Node):
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
         self.pois_sub = self.create_subscription(String, '/mapping/cmd_pois', self.pois_callback, 10)
-        self.vio_status_sub = self.create_subscription(String, '/slam/vio_status', self.vio_status_callback, 10)
 
         # pubs
         self.pose_graph_trajectory_pub = self.create_publisher(Path, "/mapping/pose_graph_trajectory", 10)
@@ -248,14 +247,6 @@ class MapNode(Node):
         self.relocalization_poses = {}
         self.relocalization_pose_weights = {}
         self.failed_relocalizations = []
-
-        # VIO restart handling: when the VIO drops out of tracking the odom frame
-        # is invalidated/redefined, so all accumulated relocalization observations
-        # become stale. Watch /slam/vio_status and reset the relocalization state
-        # on the tracking -> non-tracking edge. TRACKING <-> TRACKING_STATIC is a
-        # normal moving/standing-still switch and does NOT count as a dropout.
-        self.vio_tracking_states = {"TRACKING", "TRACKING_STATIC"}
-        self.vio_was_tracking = False
 
         self.T_from_map_to_odom = None
 
@@ -354,37 +345,6 @@ class MapNode(Node):
 
     def continuous_odom_callback(self, odom_msg: Odometry):
         self.continuous_odom_recorder.record_odometry_msg(odom_msg)
-
-    def vio_status_callback(self, msg: String):
-        tracking_now = msg.data in self.vio_tracking_states
-        # tracking -> non-tracking edge: the VIO is restarting / lost, so the odom
-        # frame is about to be (or already) redefined. Drop all stale relocalization
-        # state; it re-acquires from scratch once tracking + relocalization resume.
-        if self.vio_was_tracking and not tracking_now:
-            self.get_logger().warning(
-                f"[vio] tracking dropped to '{msg.data}', resetting relocalization state")
-            self.reset_relocalization_state()
-        self.vio_was_tracking = tracking_now
-
-    def reset_relocalization_state(self):
-        self.relocalization_poses = {}
-        self.relocalization_pose_weights = {}
-        self.T_from_map_to_odom = None
-
-        # The VIO redefined the odom frame, so the live trajectory accumulated so
-        # far is in a stale frame. If we kept it, keyframe_mapping would bridge the
-        # last pre-drop keyframe to the first post-recovery keyframe with a relative
-        # constraint that spans two different odom frames -- a garbage edge that
-        # corrupts pose_graph_used_pose. Drop the whole live
-        # trajectory instead; keyframe_mapping then restarts a fresh segment (its
-        # `len(odom)==0 and last_keyframe_timestamp is None` branch) in the new odom
-        # frame, and observed_T is self-consistent again. The loaded map
-        # (map_poses/map_embeddings) is untouched.
-        self.odom = {}
-        self.pose_graph_used_pose = {}
-        self.relative_pose_constraint = []
-        self.last_keyframe_timestamp = None
-        self._embedding_cache = {}
 
     def localization_stop_callback(self, msg: Bool):
         if msg.data:
