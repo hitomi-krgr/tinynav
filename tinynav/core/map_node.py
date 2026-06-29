@@ -823,7 +823,7 @@ class MapNode(Node):
                 # Static openness prior: min obstacle-distance over the robot -> local
                 # target segment, for the planner to size safety.
                 self._ensure_openness_map()
-                openness = self._path_openness(paths_in_map[start_i:local_i + 1], lookahead_m=float('inf'))
+                openness = self._path_openness(paths_in_map[start_i:local_i + 1])
                 if np.isfinite(openness):
                     self.path_openness_pub.publish(Float32(data=float(openness)))
 
@@ -886,21 +886,18 @@ class MapNode(Node):
             li = k
         return li
 
-    def _path_openness(self, path_in_map: np.ndarray, lookahead_m: float) -> float:
-        """Min static obstacle-distance (m) over the first lookahead_m of the path."""
+    def _path_openness(self, path_in_map: np.ndarray) -> float:
+        """Min static obstacle-distance (m) over the given path segment."""
         if self._openness2d is None or len(path_in_map) == 0:
             return float('inf')
         origin = self.occupancy_map_meta[:3]
         res = float(self.occupancy_map_meta[3])
         nx, ny = self._openness2d.shape
-        vals, acc, prev = [], 0.0, path_in_map[0]
+        vals = []
         for p in path_in_map:
-            acc += float(np.linalg.norm(p[:2] - prev[:2])); prev = p
             ix = int((p[0] - origin[0]) / res); iy = int((p[1] - origin[1]) / res)
             if 0 <= ix < nx and 0 <= iy < ny:
                 vals.append(float(self._openness2d[ix, iy]))
-            if acc >= lookahead_m:
-                break
         return min(vals) if vals else float('inf')
 
     def generate_nav_path_in_map(self, pose_in_map: np.ndarray, target_poi: np.ndarray) -> np.ndarray:
