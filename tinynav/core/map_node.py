@@ -693,7 +693,6 @@ class MapNode(Node):
         self.T_from_map_to_odom = T_estimate
 
     def try_publish_nav_path(self, timestamp: int):
-        self.get_logger().info(f"try_publish_nav_path, timestamp: {timestamp}")
         if self.T_from_map_to_odom is None:
             self.get_logger().info("Relocalization not successful yet, skip publishing nav path")
             return
@@ -707,7 +706,6 @@ class MapNode(Node):
             return
 
         poi = self.pois[self.poi_index]
-        print(f"poi: {poi}")
         poi_pose = np.eye(4)
         poi_pose[:3, 3] = poi
         self.poi_pub.publish(np2msg(poi_pose, self.get_clock().now().to_msg(), "world", "map"))
@@ -786,37 +784,24 @@ class MapNode(Node):
             # use the max_speed to publish the position the robot should be after 5 seconds
             with Timer(name = "Find target position", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
                 max_speed = 0.5
-                if len(paths_in_map) > 1:
-                    accumulated_distance = 0.0
-                    start_point = pose_in_map_position[:3]
-                    target_position = paths_in_map[-1]
-                    for i in range(len(paths_in_map) - 1):
-                        accumulated_distance += np.linalg.norm(paths_in_map[i][:2] - start_point[:2])
-                        if accumulated_distance > max_speed * 5:
-                            target_position = paths_in_map[i]
-                            break
-                        start_point = paths_in_map[i]
-                else:
-                    target_position = paths_in_map[0]
 
                 # local target = furthest point on the path reachable from the robot
                 # before the heading turns past TURN_THRESH (a corner) or LOOKAHEAD_MAX
                 # is reached. Drives to corners instead of slicing across them.
                 start_i = local_i = 0
+                target_position = paths_in_map[0]
                 if len(paths_in_map) > 1:
                     robot_xy = np.asarray(pose_in_map_position[:2])
                     start_i = int(np.argmin([np.linalg.norm(np.asarray(p[:2]) - robot_xy) for p in paths_in_map]))
                     local_i = self._local_target_index(paths_in_map, start_i, lookahead_max=max_speed * 5)
                     target_position = paths_in_map[local_i]
 
-                target_position_in_map = np.array([target_position[0], target_position[1], target_position[2]])
+                target_position_in_map = np.asarray(target_position[:3])
                 pose_in_origin_odom = self.odom[timestamp]
                 T = pose_in_origin_odom @ np.linalg.inv(pose_in_map)
                 target_position_in_odom = T[:3, :3] @ target_position_in_map + T[:3, 3]
                 dummy_pose = np.eye(4)
                 dummy_pose[:3, 3] = target_position_in_odom
-                #logging.info(f"target_position_in_odom: {target_position_in_odom}")
-                print(f"target_position_in_odom: {target_position_in_odom}")
 
                 self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))
                 path_msg = Path()
