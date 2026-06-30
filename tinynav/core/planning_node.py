@@ -215,7 +215,7 @@ def generate_trajectory_library_3d(
     """Regular sampled lattice (forward-only)."""
     num_steps = int(duration / dt) + 1
 
-    vx_max = 0.4
+    vx_max = 0.5
     n_vx = max(3, int(num_samples / 2))
     vx_samples = np.linspace(0.0, vx_max, n_vx)
     omega_y_samples = np.linspace(-np.pi / 3, np.pi / 3, num_samples)

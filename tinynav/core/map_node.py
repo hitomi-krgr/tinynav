@@ -738,8 +738,7 @@ class MapNode(Node):
                 max_speed = 0.5
 
                 # local target = furthest point on the path reachable from the robot
-                # before the heading turns past TURN_THRESH (a corner) or LOOKAHEAD_MAX
-                # is reached. Drives to corners instead of slicing across them.
+                # within LOOKAHEAD_MAX arc length.
                 start_i = local_i = 0
                 target_position = paths_in_map[0]
                 if len(paths_in_map) > 1:
@@ -803,38 +802,17 @@ class MapNode(Node):
             occ2d = (self.occupancy_map == 2).any(axis=2)
         self._openness2d = distance_transform_edt(~occ2d) * res
 
-    def _local_target_index(self, path, start_i, lookahead_max, min_lookahead=1.0,
-                            turn_thresh=np.deg2rad(45.0), smooth_m=0.4):
-        """Index of the local target: walk forward from start_i, stop at the first
-        point (beyond min_lookahead) whose smoothed heading has turned >= turn_thresh
-        from the entry heading (a corner), or when lookahead_max arc length is reached.
-        Never returns a point closer than min_lookahead in arc length."""
+    def _local_target_index(self, path, start_i, lookahead_max):
+        """Index of the local target: walk forward from start_i and return the
+        furthest point reachable within lookahead_max arc length."""
         pxy = [np.asarray(p[:2], dtype=np.float64) for p in path]
         n = len(pxy)
-        cum = [0.0] * n
-        for i in range(start_i + 1, n):
-            cum[i] = cum[i - 1] + float(np.linalg.norm(pxy[i] - pxy[i - 1]))
-
-        def sdir(i):
-            j = i
-            while j < n - 1 and (cum[j] - cum[i]) < smooth_m:
-                j += 1
-            d = pxy[j] - pxy[i]
-            L = float(np.linalg.norm(d))
-            return d / L if L > 1e-6 else None
-
-        entry = sdir(start_i)
+        cum = 0.0
         li = start_i
         for k in range(start_i + 1, n):
-            if cum[k] - cum[start_i] >= lookahead_max:
-                li = k
-                break
-            dk = sdir(k)
-            if (cum[k] - cum[start_i]) >= min_lookahead and entry is not None and dk is not None:
-                turn = abs(np.arctan2(dk[0] * entry[1] - dk[1] * entry[0], float(dk @ entry)))
-                if turn >= turn_thresh:
-                    li = k
-                    break
+            cum += float(np.linalg.norm(pxy[k] - pxy[k - 1]))
+            if cum >= lookahead_max:
+                return k
             li = k
         return li
 
