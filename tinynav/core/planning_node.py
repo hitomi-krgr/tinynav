@@ -23,6 +23,7 @@ from cv_bridge import CvBridge
 import sensor_msgs_py.point_cloud2 as pc2
 from codetiming import Timer
 from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_quat, msg2np
+from tinynav.core.traversability import WalkableConfig, WalkableConfidence, compute_walkable_obstacle
 
 
 @dataclass
@@ -407,10 +408,18 @@ class PlanningNode(Node):
 
         self.resolution = 0.05
         self.obstacle_config = ObstacleConfig()
+        # Connectivity-based walkable layer (stairs/ramps + low obstacles z-span
+        # misses). Toggle with `use_walkable:=true` to A/B against pure z-span.
+        self.declare_parameter('use_walkable', False)
+        self.use_walkable = bool(self.get_parameter('use_walkable').value)
+        self.walkable_config = WalkableConfig()
+        self.walkable_conf = None  # lazily sized once grid_shape is known
         # Derive the grid's z extent and vertical offset from the obstacle band so
         # the grid covers exactly [robot_z_bottom, robot_z_top] relative to the camera.
         z_layers = int(round((self.obstacle_config.robot_z_top - self.obstacle_config.robot_z_bottom) / self.resolution))
         self.grid_shape = (100, 100, z_layers)
+        if self.use_walkable:
+            self.walkable_conf = WalkableConfidence(self.grid_shape[:2])
         self.z_grid_drop = -(self.obstacle_config.robot_z_top + self.obstacle_config.robot_z_bottom) / 2
         self.origin = np.array(self.grid_shape) * self.resolution / -2.
         self.step = 10
@@ -656,12 +665,28 @@ class PlanningNode(Node):
             )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
 
+            # Walkable layer is visualization-only for now: it does NOT feed ESDF,
+            # scoring, or any decision. Compute it only on vis cycles to publish.
+            walkable_obstacle_mask = None
+            if self.use_walkable and vis_now:
+                walkable_obstacle_mask = compute_walkable_obstacle(
+                    self.occupancy_grid, self.origin, self.resolution,
+                    robot_z=T[2, 3], zspan=obstacle_mask,
+                    cfg=self.walkable_config, conf=self.walkable_conf,
+                    fallback_drop=-self.obstacle_config.robot_z_bottom,
+                    z_band=(self.obstacle_config.robot_z_bottom,
+                            self.obstacle_config.robot_z_top),
+                )
+
         if vis_now:
             with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
                 self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
                 self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
                 self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
-                self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
+                # Decisions use the z-span obstacle_mask; for display we show the
+                # walkable layer when enabled (does not affect planning).
+                vis_mask = walkable_obstacle_mask if walkable_obstacle_mask is not None else obstacle_mask
+                self.publish_obstacle_mask(vis_mask, depth_msg.header.stamp)
                 self.publish_footprint(T, depth_msg.header.stamp)
 
         with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
