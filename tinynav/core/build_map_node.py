@@ -35,7 +35,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from tinynav.core.math_utils import matrix_to_quat, msg2np, estimate_pose, tf2np, depth_to_cloud
 from tinynav.core.models_trt import LightGlueTRT, Dinov2TRT, SuperPointTRT
-from tinynav.core.planning_common import run_raycasting_loopy
+from tinynav.core.planning_node import run_raycasting_loopy
 from tinynav.tinynav_cpp_bind import pose_graph_solve
 from tool.video_db import VideoDB
 
