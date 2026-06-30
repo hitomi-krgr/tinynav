@@ -517,6 +517,27 @@ class PlanningNode(Node):
         msg.points = points
         self.footprint_pub.publish(msg)
 
+    def _footprint_seed_cells(self, T):
+        """Grid cells the robot footprint covers, as flood-fill seeds for the
+        walkable layer. The robot stands here, so these cells are walkable by
+        definition. Rasterizes the oriented footprint rectangle (front_len,
+        rear_len, half_w) at grid resolution -- unlike a fixed center block this
+        tracks the real device size and the camera->control-center offset."""
+        center = self.camera_to_robot_center(T)
+        fwd = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
+        left = T[:3, :3] @ np.array([1.0, 0.0, 0.0])
+        fl, rl, hw = self.robot.footprint_from_control()
+        n_f = int(np.ceil((fl + rl) / self.resolution)) + 1
+        n_w = int(np.ceil(2 * hw / self.resolution)) + 1
+        cells = set()
+        for u in np.linspace(-rl, fl, n_f):
+            for v in np.linspace(-hw, hw, n_w):
+                p = center + fwd * u + left * v
+                i = int((p[0] - self.origin[0]) / self.resolution)
+                j = int((p[1] - self.origin[1]) / self.resolution)
+                cells.add((i, j))
+        return list(cells)
+
     def _front_obstacle_dist(self, T, obstacle_mask, max_dist=0.5):
         """Distance from the robot's front face to the nearest obstacle in the forward corridor.
         Scans start at the front face so the returned value matches physical clearance."""
@@ -676,6 +697,7 @@ class PlanningNode(Node):
                     fallback_drop=-self.obstacle_config.robot_z_bottom,
                     z_band=(self.obstacle_config.robot_z_bottom,
                             self.obstacle_config.robot_z_top),
+                    seed_cells=self._footprint_seed_cells(T),
                 )
 
         if vis_now:

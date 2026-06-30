@@ -208,7 +208,8 @@ def estimate_floor_height(height, center_cell, radius_cells, robot_z,
 
 
 def compute_walkable_obstacle(occupancy_grid, origin, resolution, robot_z, zspan,
-                              cfg=None, conf=None, fallback_drop=0.4, z_band=None):
+                              cfg=None, conf=None, fallback_drop=0.4, z_band=None,
+                              seed_cells=None):
     """Connectivity-based obstacle mask, integrating the z-span result.
 
     Approach: floor reachable from the robot foot via small steps is walkable
@@ -227,6 +228,10 @@ def compute_walkable_obstacle(occupancy_grid, origin, resolution, robot_z, zspan
         z_band: optional (z_lo_rel, z_hi_rel) height band relative to robot_z;
             pass the grid's [robot_z_bottom, robot_z_top] so a high-mounted
             camera still sees the floor. None => symmetric +/- cfg.height_band_m.
+        seed_cells: optional list of (i, j) cells the robot footprint occupies
+            (the flood-fill origin -- the robot stands here so it IS walkable).
+            None => a small 5x5 block at the grid center (legacy fallback; does
+            NOT reflect the real device footprint).
 
     Returns:
         (NX, NY) bool obstacle mask (obstacle = ~walkable).
@@ -237,8 +242,11 @@ def compute_walkable_obstacle(occupancy_grid, origin, resolution, robot_z, zspan
     height, observed = extract_height_map(occupancy_grid, origin, resolution, robot_z, cfg, z_band=z_band)
 
     ci, cj = nx // 2, ny // 2
-    seeds = [(i, j) for i in range(ci - 2, ci + 3) for j in range(cj - 2, cj + 3)
-             if 0 <= i < nx and 0 <= j < ny]
+    if seed_cells:
+        seeds = [(i, j) for (i, j) in seed_cells if 0 <= i < nx and 0 <= j < ny]
+    else:
+        seeds = [(i, j) for i in range(ci - 2, ci + 3) for j in range(cj - 2, cj + 3)
+                 if 0 <= i < nx and 0 <= j < ny]
     floor_h = estimate_floor_height(height, (ci, cj), radius_cells=10,
                                     robot_z=robot_z, fallback_drop=fallback_drop)
 
