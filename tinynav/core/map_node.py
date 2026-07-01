@@ -4,7 +4,8 @@ import time
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path, Odometry
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, Float32
+from scipy.ndimage import distance_transform_edt
 import numpy as np
 import sys
 import json
@@ -18,7 +19,6 @@ import cv2
 from codetiming import Timer
 import argparse
 
-from tinynav.tinynav_cpp_bind import pose_graph_solve
 from tinynav.core.models_trt import LightGlueTRT, Dinov2TRT, SuperPointTRT
 import logging
 import asyncio
@@ -221,12 +221,13 @@ class MapNode(Node):
         self.pose_graph_used_pose = {}
         self.relative_pose_constraint = []
         self.last_keyframe_timestamp = None
+        # timestamp -> DINOv2 embedding, populated as keyframes arrive (see keyframe_mapping).
+        self._embedding_cache = {}
 
         self.loop_similarity_threshold = 0.90
         self.loop_top_k = 1
 
         self.relocalization_threshold = 0.85
-        self.relocalization_loop_top_k = 3
 
         os.makedirs(f"{tinynav_db_path}/nav_temp", exist_ok=True)
         self.nav_temp_db = TinyNavDB(f"{tinynav_db_path}/nav_temp", is_scratch=True)
@@ -246,9 +247,21 @@ class MapNode(Node):
         self.relocalization_pose_weights = {}
         self.failed_relocalizations = []
 
+        # Lock-once relocalization: relocalize every keyframe only until we have a
+        # consistent fix, then freeze T_from_map_to_odom and ride odom from there.
+        # DINOv2 retrieval can match a wrong-but-similar place on a single frame, so
+        # we don't trust the first success -- we require the most recent few
+        # observations of T_from_map_to_odom to agree spatially before locking.
+        # Sliding window (not fill-then-clear) so a stray bad observation can't keep
+        # resetting the count.
+        self.reloc_lock_window = 3          # recent observations that must agree
+        self.reloc_lock_tol = 0.3           # meters; max pairwise translation spread
+        self._reloc_obs_window = []         # recent observation_T_from_map_to_odom (4x4)
+
         self.T_from_map_to_odom = None
 
         self.pois = {}
+        self.poi_meta = {}
         self.poi_index = -1
         self._nav_completed = False
         self._leg_initial_length: float | None = None
@@ -263,27 +276,47 @@ class MapNode(Node):
         self.current_pose_pub = self.create_publisher(Odometry, "/mapping/current_pose", 10)
         self.global_plan_pub = self.create_publisher(Path, '/mapping/global_plan', 10)
         self.target_pose_pub = self.create_publisher(Odometry, "/control/target_pose", 10)
+        # Static openness prior: min obstacle-distance over the upcoming global segment.
+        self.path_openness_pub = self.create_publisher(Float32, '/mapping/path_openness', 10)
+        self._openness2d = None  # lazily-built 2D obstacle EDT (m) over the robot z-band
+        self._openness_map_id = None  # id() of occupancy_map the EDT was built from
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self._save_completed = False
 
+        # Persistent event loop reused across all TRT inferences. asyncio.run()
+        # builds and tears down a fresh loop on every call, which is pure overhead
+        # at keyframe rate.
+        self._loop = asyncio.new_event_loop()
+
+    def _run(self, coro):
+        return self._loop.run_until_complete(coro)
+
     def pois_callback(self, msg: String):
         self.get_logger().info("Received POIs from planner: " + msg.data)
         try:
-            self.pois = json.loads(msg.data)
+            raw_pois = json.loads(msg.data)
 
             pois_dict = {}
-            keys = sorted([int (key) for key in self.pois.keys()])
+            poi_meta = {}
+            keys = sorted([int(key) for key in raw_pois.keys()])
             for index, key in enumerate(keys):
-                pois_dict[index] = np.array(self.pois[str(key)]["position"])
+                raw_poi = raw_pois[str(key)]
+                pois_dict[index] = np.array(raw_poi["position"])
+                poi_meta[index] = {
+                    "id": raw_poi.get("id", key),
+                    "name": raw_poi.get("name"),
+                }
             self.pois = pois_dict
+            self.poi_meta = poi_meta
 
             if not self.pois:
                 self.poi_index = -1
                 # Signal planning_node to clear target_pose so it stops publishing paths
                 dummy_pose = np.eye(4)
                 self.poi_change_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "map"))
+                self.poi_meta = {}
                 self.get_logger().info("POIs cleared, navigation cancelled")
                 return
 
@@ -296,6 +329,20 @@ class MapNode(Node):
         except json.JSONDecodeError as e:
             self.get_logger().error(f"Failed to parse POIs JSON: {e}")
             self.pois = {}
+            self.poi_meta = {}
+
+    def _nav_progress_payload(self, *, percent: float, path_remaining_m: float,
+                              path_total_m: float, estimated_remaining_s: float) -> dict:
+        meta = self.poi_meta.get(self.poi_index, {})
+        return {
+            "poi_index": self.poi_index,  # route index in the current command queue
+            "poi_id": meta.get("id"),
+            "poi_name": meta.get("name"),
+            "percent": percent,
+            "path_remaining_m": path_remaining_m,
+            "path_total_m": path_total_m,
+            "estimated_remaining_s": estimated_remaining_s,
+        }
 
     def info_callback(self, msg:CameraInfo):
         if self.K is None:
@@ -330,13 +377,25 @@ class MapNode(Node):
                 self.localization_data_saved_pub.publish(save_finished_msg)
 
     def keyframe_callback(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
-        self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg)
+        if self.K is None:
+            return
         image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
+        # Compute SuperPoint features and DINOv2 embedding ONCE here and reuse them
+        # in both mapping and relocalization. Previously each was recomputed inside
+        # keyframe_mapping and keyframe_relocalization, doubling the TRT inference
+        # cost of every keyframe.
+        features = self._run(self.super_point_extractor.infer(image))
+        embedding = self.get_embeddings(image)
+
+        self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg, image, features, embedding)
 
         keyframe_image_timestamp_ns = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
-        success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image)
-        if success:
-            self.compute_transform_from_map_to_odom()
+        # Once locked, T_from_map_to_odom is frozen and we ride odom -- skip
+        # relocalization entirely (also saves the TRT match/PnP cost per keyframe).
+        if self.T_from_map_to_odom is None:
+            success, pose_in_world = self.keyframe_relocalization(keyframe_image_msg.header.stamp, image, features, embedding)
+            if success:
+                self.try_lock_transform_from_map_to_odom(keyframe_image_timestamp_ns)
 
         with Timer(name = "nav path", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
             self.try_publish_nav_path(keyframe_image_timestamp_ns)
@@ -345,11 +404,11 @@ class MapNode(Node):
             # compute the coordinate transform from the map pose to the keyframe pose
             # publish the nav path from the map pose to the keyframe pose with the cost map
 
-    def keyframe_mapping_with_timer(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+    def keyframe_mapping_with_timer(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, image, features, embedding):
         with Timer(name="Mapping Loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
-            self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg)
+            self.keyframe_mapping(keyframe_image_msg, keyframe_odom_msg, depth_msg, image, features, embedding)
 
-    def keyframe_mapping(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image):
+    def keyframe_mapping(self, keyframe_image_msg:Image, keyframe_odom_msg:Odometry, depth_msg:Image, image, features, embedding):
         if self.K is None:
             return
         keyframe_image_timestamp = int(keyframe_image_msg.header.stamp.sec * 1e9) + int(keyframe_image_msg.header.stamp.nanosec)
@@ -359,14 +418,14 @@ class MapNode(Node):
         assert keyframe_image_timestamp == depth_timestamp
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
         odom, _ = msg2np(keyframe_odom_msg)
-        image = self.bridge.imgmsg_to_cv2(keyframe_image_msg, desired_encoding="mono8")
         rgb_image_place_holder = einops.repeat(image, "h w -> h w c", c = 3)
 
         self.nav_temp_db.set_entry(keyframe_image_timestamp, depth = depth, infra1_image = image, rgb_image = rgb_image_place_holder)
-        embedding = self.get_embeddings(image)
         self.nav_temp_db.set_entry(keyframe_image_timestamp, embedding = embedding)
-        features = asyncio.run(self.super_point_extractor.infer(image))
         self.nav_temp_db.set_entry(keyframe_image_timestamp, features = features)
+        # In-memory embedding cache so find_loop does not re-read every keyframe's
+        # embedding from the DB on each call (was O(N) DB reads per keyframe -> O(N^2)).
+        self._embedding_cache[keyframe_image_timestamp] = embedding
 
         if len(self.odom) == 0 and self.last_keyframe_timestamp is None:
             self.odom[keyframe_odom_timestamp] = odom
@@ -378,9 +437,9 @@ class MapNode(Node):
             self.pose_graph_used_pose[keyframe_image_timestamp] = odom
             self.odom[keyframe_image_timestamp] = odom
             def find_loop_and_pose_graph(timestamp):
-                    target_embedding = self.nav_temp_db.get_embedding(timestamp)
+                    target_embedding = self._embedding_cache[timestamp]
                     valid_timestamp = [t for t in self.pose_graph_used_pose.keys() if t + 10 * 1e9 < timestamp]
-                    valid_embeddings = np.array([self.nav_temp_db.get_embedding(t) for t in valid_timestamp])
+                    valid_embeddings = np.array([self._embedding_cache[t] for t in valid_timestamp])
 
                     idx_to_timestamp = {i:t for i, t in enumerate(valid_timestamp)}
                     with Timer(name = "find loop", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
@@ -406,10 +465,10 @@ class MapNode(Node):
 
     def get_embeddings(self, image: np.ndarray) -> np.ndarray:
         # shape: (1, 768)
-        return asyncio.run(self.dinov2_model.infer(image))
+        return self._run(self.dinov2_model.infer(image))
 
     def match_keypoints(self, feats0:dict, feats1:dict, image_shape = np.array([848, 480], dtype = np.int64)) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        match_result = asyncio.run(self.light_glue_matcher.infer(feats0["kpts"], feats1["kpts"], feats0['descps'], feats1['descps'], feats0['mask'], feats1['mask'], image_shape, image_shape))
+        match_result = self._run(self.light_glue_matcher.infer(feats0["kpts"], feats1["kpts"], feats0['descps'], feats1['descps'], feats0['mask'], feats1['mask'], image_shape, image_shape))
         match_indices = match_result["match_indices"][0]
         valid_mask = match_indices != -1
         keypoints0 = feats0["kpts"][0][valid_mask]
@@ -440,13 +499,12 @@ class MapNode(Node):
             path_msg.poses.append(pose)
         self.pose_graph_trajectory_pub.publish(path_msg)
 
-    def relocalize_with_depth(self, keyframe: np.ndarray, keyframe_features: dict, K: np.ndarray | None) -> tuple[bool, np.ndarray, float]:
+    def relocalize_with_depth(self, keyframe: np.ndarray, keyframe_features: dict, K: np.ndarray | None, query_embedding: np.ndarray) -> tuple[bool, np.ndarray, float]:
         if K is None:
             return False, np.eye(4), -np.inf
-        query_embedding = self.get_embeddings(keyframe)
         query_embedding_normed = query_embedding / np.linalg.norm(query_embedding)
 
-        idx_and_similarity_array = find_loop(query_embedding_normed, self.map_embeddings, self.relocalization_threshold, self.relocalization_loop_top_k)
+        idx_and_similarity_array = find_loop(query_embedding_normed, self.map_embeddings, self.relocalization_threshold, 1)
         max_similarity = np.max([similarity for _, similarity in idx_and_similarity_array]) if len(idx_and_similarity_array) > 0 else 0
         if len(idx_and_similarity_array) == 0:
             print(f"not enough similar embeddings to relocalize, {len(idx_and_similarity_array)}, max_similarity : {max_similarity}")
@@ -480,28 +538,19 @@ class MapNode(Node):
         return False, np.eye(4), -np.inf
 
     def keypoint_with_depth_to_3d(self, keypoints:np.ndarray, depth:np.ndarray, pose_from_camera_to_world:np.ndarray, K:np.ndarray):
-        point_in_camera = []
-        inliers = []
         fx = K[0, 0]
         fy = K[1, 1]
         cx = K[0, 2]
         cy = K[1, 2]
-        for kp in keypoints:
-            u = int(kp[0])
-            v = int(kp[1])
-            Z = depth[v, u]
-            if Z > 0 and Z < 50:
-                X = (u - cx) * Z / fx
-                Y = (v - cy) * Z / fy
-                inliers.append(True)
-            else:
-                X = 0
-                Y = 0
-                inliers.append(False)
-            point_in_camera.append(np.array([X, Y, Z]))
+        # Vectorized projection of all keypoints (was a per-keypoint Python loop).
+        u = keypoints[:, 0].astype(np.int64)
+        v = keypoints[:, 1].astype(np.int64)
+        Z = depth[v, u]
+        inliers = (Z > 0) & (Z < 50)
+        X = np.where(inliers, (u - cx) * Z / fx, 0.0)
+        Y = np.where(inliers, (v - cy) * Z / fy, 0.0)
         # shape: (N, 3)
-        point_in_camera = np.array(point_in_camera)
-        inliers = np.array(inliers)
+        point_in_camera = np.stack([X, Y, Z], axis=1)
         rotation = pose_from_camera_to_world[:3, :3]
         translation = pose_from_camera_to_world[:3,3]
 
@@ -509,9 +558,8 @@ class MapNode(Node):
         return point_in_world, inliers
 
     @Timer(name="Relocalization loop", text="\n\n[{name}] Elapsed time: {milliseconds:.0f} ms")
-    def keyframe_relocalization(self, timestamp, image:np.ndarray) -> tuple[bool, np.ndarray]:
-        features = asyncio.run(self.super_point_extractor.infer(image))
-        res, pose_in_camera, pose_cov_weight = self.relocalize_with_depth(image, features, self.K)
+    def keyframe_relocalization(self, timestamp, image:np.ndarray, features:dict, embedding:np.ndarray) -> tuple[bool, np.ndarray]:
+        res, pose_in_camera, pose_cov_weight = self.relocalize_with_depth(image, features, self.K, embedding)
         if res:
             # publish the relocalization pose for debug
             pose_in_world = np.linalg.inv(pose_in_camera)
@@ -557,30 +605,46 @@ class MapNode(Node):
             pass
 
 
-    def compute_transform_from_map_to_odom(self):
-        """
-        Solve the optmization problem.
-        """
-        relative_pose_constraint = []
-        optimized_parameters = {
-            0 : np.eye(4) if self.T_from_map_to_odom is None else self.T_from_map_to_odom,
-            1 : np.eye(4),
-        }
-        constant_pose_index_dict = { 1: True }
-        for timestamp, pose in self.relocalization_poses.items():
-            if timestamp in self.pose_graph_used_pose:
-                camera_in_map_world = pose
-                camera_in_odom_world = self.pose_graph_used_pose[timestamp]
-                observation_T_from_map_to_odom =  camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
-                weight = self.relocalization_pose_weights[timestamp]
+    def try_lock_transform_from_map_to_odom(self, timestamp: int):
+        """Lock T_from_map_to_odom from a single consistent burst of relocalizations.
 
-                relative_pose_constraint.append((0, 1, observation_T_from_map_to_odom, weight * np.array([10.0, 10.0, 10.0]), weight * np.array([10.0, 10.0, 10.0])))
-        relative_pose_constraint = relative_pose_constraint[-100:]
-        optimized_parameters = pose_graph_solve(optimized_parameters, relative_pose_constraint, constant_pose_index_dict, max_iteration_num = 1000)
-        self.T_from_map_to_odom = optimized_parameters[0]
+        Each successful relocalization gives one observation of the (constant)
+        map->odom transform. DINOv2 retrieval can occasionally match a wrong place,
+        so we don't trust one observation: we keep a sliding window of the most
+        recent few and only lock once they all agree spatially (pairwise translation
+        spread <= reloc_lock_tol). Once locked we never recompute -- the caller stops
+        relocalizing and rides odom.
+        """
+        if timestamp not in self.pose_graph_used_pose:
+            return
+        camera_in_map_world = self.relocalization_poses[timestamp]
+        camera_in_odom_world = self.pose_graph_used_pose[timestamp]
+        observation_T_from_map_to_odom = camera_in_odom_world @ np.linalg.inv(camera_in_map_world)
+
+        self._reloc_obs_window.append(observation_T_from_map_to_odom)
+        self._reloc_obs_window = self._reloc_obs_window[-self.reloc_lock_window:]
+        if len(self._reloc_obs_window) < self.reloc_lock_window:
+            return
+
+        translations = np.array([T[:3, 3] for T in self._reloc_obs_window])
+        spread = float(np.max([
+            np.linalg.norm(translations[i] - translations[j])
+            for i in range(len(translations))
+            for j in range(i + 1, len(translations))
+        ]))
+        if spread > self.reloc_lock_tol:
+            self.get_logger().info(
+                f"[reloc-lock] {len(self._reloc_obs_window)} obs not consistent yet, "
+                f"spread={spread:.2f}m > tol={self.reloc_lock_tol}m")
+            return
+
+        # Consistent burst -> lock to the most recent observation and freeze.
+        self.T_from_map_to_odom = observation_T_from_map_to_odom
+        self.get_logger().info(
+            f"[reloc-lock] locked T_from_map_to_odom (spread={spread:.2f}m over "
+            f"{self.reloc_lock_window} obs)")
 
     def try_publish_nav_path(self, timestamp: int):
-        self.get_logger().info(f"try_publish_nav_path, timestamp: {timestamp}")
         if self.T_from_map_to_odom is None:
             self.get_logger().info("Relocalization not successful yet, skip publishing nav path")
             return
@@ -594,7 +658,6 @@ class MapNode(Node):
             return
 
         poi = self.pois[self.poi_index]
-        print(f"poi: {poi}")
         poi_pose = np.eye(4)
         poi_pose[:3, 3] = poi
         self.poi_pub.publish(np2msg(poi_pose, self.get_clock().now().to_msg(), "world", "map"))
@@ -609,16 +672,14 @@ class MapNode(Node):
             diff_position_norm_xy = np.linalg.norm(poi[:2] - pose_in_map_position[:2])
             diff_position_norm_z = np.linalg.norm(poi[2] - pose_in_map_position[2])
             if diff_position_norm_xy < 0.5 and diff_position_norm_z < 2.0:
-                if self._leg_initial_length is not None:
-                    arrived_msg = String()
-                    arrived_msg.data = json.dumps({
-                        "poi_index": self.poi_index,
-                        "percent": 100.0,
-                        "path_remaining_m": 0.0,
-                        "path_total_m": round(self._leg_initial_length, 2),
-                        "estimated_remaining_s": 0.0,
-                    })
-                    self.nav_progress_pub.publish(arrived_msg)
+                arrived_msg = String()
+                arrived_msg.data = json.dumps(self._nav_progress_payload(
+                    percent=100.0,
+                    path_remaining_m=0.0,
+                    path_total_m=round(self._leg_initial_length or 0.0, 2),
+                    estimated_remaining_s=0.0,
+                ))
+                self.nav_progress_pub.publish(arrived_msg)
                 self.poi_index += 1
                 self._leg_initial_length = None
                 self._leg_start_time = None
@@ -664,38 +725,35 @@ class MapNode(Node):
             estimated_remaining_s = remaining_length / self._speed_estimate if self._speed_estimate else -1.0
 
             progress_msg = String()
-            progress_msg.data = json.dumps({
-                "poi_index": self.poi_index,
-                "percent": round(percent, 1),
-                "path_remaining_m": round(remaining_length, 2),
-                "path_total_m": round(initial, 2),
-                "estimated_remaining_s": round(estimated_remaining_s, 1),
-            })
+            progress_msg.data = json.dumps(self._nav_progress_payload(
+                percent=round(percent, 1),
+                path_remaining_m=round(remaining_length, 2),
+                path_total_m=round(initial, 2),
+                estimated_remaining_s=round(estimated_remaining_s, 1),
+            ))
             self.nav_progress_pub.publish(progress_msg)
 
             # use the max_speed to publish the position the robot should be after 5 seconds
             with Timer(name = "Find target position", text="[{name}] Elapsed time: {milliseconds:.0f} ms", logger=self.timer_logger):
                 max_speed = 0.5
+
+                # local target = furthest point on the path reachable from the robot
+                # before the heading turns past TURN_THRESH (a corner) or LOOKAHEAD_MAX
+                # is reached. Drives to corners instead of slicing across them.
+                start_i = local_i = 0
+                target_position = paths_in_map[0]
                 if len(paths_in_map) > 1:
-                    accumulated_distance = 0.0
-                    start_point = pose_in_map_position[:3]
-                    target_position = paths_in_map[-1]
-                    for i in range(len(paths_in_map) - 1):
-                        accumulated_distance += np.linalg.norm(paths_in_map[i][:2] - start_point[:2])
-                        if accumulated_distance > max_speed * 5:
-                            target_position = paths_in_map[i]
-                            break
-                        start_point = paths_in_map[i]
-                else:
-                    target_position = paths_in_map[0]
-                target_position_in_map = np.array([target_position[0], target_position[1], target_position[2]])
+                    robot_xy = np.asarray(pose_in_map_position[:2])
+                    start_i = int(np.argmin([np.linalg.norm(np.asarray(p[:2]) - robot_xy) for p in paths_in_map]))
+                    local_i = self._local_target_index(paths_in_map, start_i, lookahead_max=max_speed * 5)
+                    target_position = paths_in_map[local_i]
+
+                target_position_in_map = np.asarray(target_position[:3])
                 pose_in_origin_odom = self.odom[timestamp]
                 T = pose_in_origin_odom @ np.linalg.inv(pose_in_map)
                 target_position_in_odom = T[:3, :3] @ target_position_in_map + T[:3, 3]
                 dummy_pose = np.eye(4)
                 dummy_pose[:3, 3] = target_position_in_odom
-                #logging.info(f"target_position_in_odom: {target_position_in_odom}")
-                print(f"target_position_in_odom: {target_position_in_odom}")
 
                 self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))
                 path_msg = Path()
@@ -713,9 +771,86 @@ class MapNode(Node):
                     pose.pose.orientation.w = 1.0
                     path_msg.poses.append(pose)
                 self.global_plan_pub.publish(path_msg)
+
+                # Static openness prior: min obstacle-distance over the robot -> local
+                # target segment, for the planner to size safety.
+                self._ensure_openness_map()
+                openness = self._path_openness(paths_in_map[start_i:local_i + 1])
+                if np.isfinite(openness):
+                    self.path_openness_pub.publish(Float32(data=float(openness)))
+
                 self.tf_broadcaster.sendTransform(np2tf(T, self.get_clock().now().to_msg(), "world", "map"))
         else:
             logging.info("No path found in map")
+
+    def _ensure_openness_map(self):
+        """Build a 2D obstacle-distance field (m) by collapsing occupied cells over a
+        z-band around the working height (median z of the recorded mapping poses) +-
+        0.4 m, then EDT. Reflects static corridor width. Recomputed whenever the
+        occupancy_map is reloaded (map switch / handoff)."""
+        if self._openness2d is not None and self._openness_map_id == id(self.occupancy_map):
+            return
+        self._openness_map_id = id(self.occupancy_map)
+        origin = self.occupancy_map_meta[:3]
+        res = float(self.occupancy_map_meta[3])
+        work_z = float(np.median([np.asarray(p)[2, 3] for p in self.map_poses.values()]))
+        z_dim = self.occupancy_map.shape[2]
+        z_world = origin[2] + (np.arange(z_dim) + 0.5) * res
+        band = (z_world >= work_z - 0.4) & (z_world <= work_z + 0.4)
+        if band.any():
+            occ2d = (self.occupancy_map[:, :, band] == 2).any(axis=2)
+        else:
+            occ2d = (self.occupancy_map == 2).any(axis=2)
+        self._openness2d = distance_transform_edt(~occ2d) * res
+
+    def _local_target_index(self, path, start_i, lookahead_max, min_lookahead=1.0,
+                            turn_thresh=np.deg2rad(60.0), smooth_m=0.4):
+        """Index of the local target: walk forward from start_i, stop at the first
+        point (beyond min_lookahead) whose smoothed heading has turned >= turn_thresh
+        from the entry heading (a corner), or when lookahead_max arc length is reached.
+        Never returns a point closer than min_lookahead in arc length."""
+        pxy = [np.asarray(p[:2], dtype=np.float64) for p in path]
+        n = len(pxy)
+        cum = [0.0] * n
+        for i in range(start_i + 1, n):
+            cum[i] = cum[i - 1] + float(np.linalg.norm(pxy[i] - pxy[i - 1]))
+
+        def sdir(i):
+            j = i
+            while j < n - 1 and (cum[j] - cum[i]) < smooth_m:
+                j += 1
+            d = pxy[j] - pxy[i]
+            L = float(np.linalg.norm(d))
+            return d / L if L > 1e-6 else None
+
+        entry = sdir(start_i)
+        li = start_i
+        for k in range(start_i + 1, n):
+            if cum[k] - cum[start_i] >= lookahead_max:
+                li = k
+                break
+            dk = sdir(k)
+            if (cum[k] - cum[start_i]) >= min_lookahead and entry is not None and dk is not None:
+                turn = abs(np.arctan2(dk[0] * entry[1] - dk[1] * entry[0], float(dk @ entry)))
+                if turn >= turn_thresh:
+                    li = k
+                    break
+            li = k
+        return li
+
+    def _path_openness(self, path_in_map: np.ndarray) -> float:
+        """Min static obstacle-distance (m) over the given path segment."""
+        if self._openness2d is None or len(path_in_map) == 0:
+            return float('inf')
+        origin = self.occupancy_map_meta[:3]
+        res = float(self.occupancy_map_meta[3])
+        nx, ny = self._openness2d.shape
+        vals = []
+        for p in path_in_map:
+            ix = int((p[0] - origin[0]) / res); iy = int((p[1] - origin[1]) / res)
+            if 0 <= ix < nx and 0 <= iy < ny:
+                vals.append(float(self._openness2d[ix, iy]))
+        return min(vals) if vals else float('inf')
 
     def generate_nav_path_in_map(self, pose_in_map: np.ndarray, target_poi: np.ndarray) -> np.ndarray:
         dummy_poi_pose = np.eye(4)
@@ -751,6 +886,18 @@ class MapNode(Node):
             return None 
         sdf_start_path = search_close_to_sdf_map(start_idx, self.sdf_map, self.occupancy_map, 0.2)
         sdf_goal_path = search_close_to_sdf_map(poi_goal_idx, self.sdf_map, self.occupancy_map, 0.2)
+
+        # search_close_to_sdf_map returns [] when no free cell within stop_distance is
+        # reachable from start/goal (robot or POI sits in/against an obstacle). Treat it
+        # like an out-of-bounds index: bail with None instead of indexing [-1] and
+        # crashing the whole map_node process (which stalls nav -> nav_done never fires
+        # -> map handoff never triggers).
+        if len(sdf_start_path) == 0 or len(sdf_goal_path) == 0:
+            self.get_logger().warning(
+                f"search_close_to_sdf_map found no free cell: "
+                f"start_empty={len(sdf_start_path) == 0}, goal_empty={len(sdf_goal_path) == 0}"
+            )
+            return None
 
         sdf_start_sdf = sdf_start_path[-1]
         sdf_goal_sdf = sdf_goal_path[-1]

@@ -1,20 +1,27 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo, PointField
-from nav_msgs.msg import Path, Odometry, OccupancyGrid
-from cv_bridge import CvBridge
+"""Occupancy-grid + ESDF + trajectory-library planner.
+
+The planner builds a rolling 3D occupancy grid from depth, derives a 2D
+obstacle map + ESDF, samples a trajectory library, and selects the trajectory
+that minimizes a cost of clearance + distance-to-goal (+ smoothness), subject
+to a hard collision filter and a reverse gate.
+"""
+
 import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_dilation
 from dataclasses import dataclass
 from numba import njit
-import message_filters
-from rclpy.time import Time
-from sensor_msgs.msg import PointCloud2, PointCloud
-from geometry_msgs.msg import PoseStamped, Point32
-import sensor_msgs_py.point_cloud2 as pc2
-from std_msgs.msg import Header
-from codetiming import Timer
 import cv2
+import rclpy
+import message_filters
+from rclpy.node import Node
+from rclpy.time import Time
+from sensor_msgs.msg import Image, CameraInfo, PointField, PointCloud2, PointCloud
+from nav_msgs.msg import Path, Odometry, OccupancyGrid
+from geometry_msgs.msg import PoseStamped, Point32
+from std_msgs.msg import Header, Float32
+from cv_bridge import CvBridge
+import sensor_msgs_py.point_cloud2 as pc2
+from codetiming import Timer
 from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_quat, msg2np
 
 
@@ -51,7 +58,7 @@ class RobotConfig:
 
 GO2_CONFIG = RobotConfig(
     name='go2', shape='square',
-    length=0.4, width=0.3,
+    length=0.7, width=0.3,
     camera_x=0.2, camera_y=0.0,
     control_x=0.0, control_y=0.0,
     safety_radius=0.2,
@@ -59,11 +66,12 @@ GO2_CONFIG = RobotConfig(
 
 B2_CONFIG = RobotConfig(
     name='b2', shape='square',
-    length=1.0, width=0.5,
+    length=0.8, width=0.3,
     camera_x=0.5, camera_y=0.0,
-    control_x=-0.5, control_y=0.0,
+    control_x=0.0, control_y=0.0,
     safety_radius=0.1,
 )
+
 
 # === Helper functions ===
 @njit(cache=True)
@@ -151,16 +159,23 @@ def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy
 
 @dataclass
 class ObstacleConfig:
-    robot_z_bottom: float = -0.4
-    robot_z_top: float = 0.4
+    robot_z_bottom: float = -0.7
+    robot_z_top: float = 0.3
     occ_threshold: float = 0.1
     min_wall_span_m: float = 0.2
-    dilation_cells: int = 2
+    ground_band_m: float = 0.3
+    floating_min_span_m: float = 0.05
+    dilation_cells: int = 0
 
 
 def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None):
     """Obstacle = cells where occupied voxels span >= min_wall_span_m in z.
-    Walls have large z-span; stair risers / ground bumps have small span."""
+    The span filter only applies to cells whose lowest occupied voxel sits near
+    the ground (within ground_band_m of robot_z_bottom): walls have large z-span
+    while stair risers / ground bumps have small span. Cells whose occupancy
+    starts above that ground band (floating / mid-height obstacles) use a much
+    smaller span threshold (floating_min_span_m) just to reject single-voxel
+    noise, so real low-profile obstacles are still kept."""
     config = config or ObstacleConfig()
     h, w, z_dim = occupancy_grid.shape
     z_world = origin[2] + (np.arange(z_dim) + 0.5) * resolution
@@ -172,19 +187,29 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
         band_occ = occupancy_grid[:, :, z_mask] > config.occ_threshold
         has_occ = np.any(band_occ, axis=2)
         n_z = band_occ.shape[2]
+        z_rel_band = z_rel[z_mask]
         z_idx = np.arange(n_z, dtype=np.float32)
         occ_high = np.where(band_occ, z_idx[np.newaxis, np.newaxis, :], -1).max(axis=2)
         occ_low = np.where(band_occ, z_idx[np.newaxis, np.newaxis, :], n_z).min(axis=2)
         z_span = (occ_high - occ_low) * resolution
-        obstacle = has_occ & (z_span >= config.min_wall_span_m)
+        # relative height of the lowest occupied voxel in each cell
+        low_z_rel = z_rel_band[np.clip(occ_low, 0, n_z - 1).astype(np.int64)]
+        near_ground = low_z_rel <= config.robot_z_bottom + config.ground_band_m
+        # ground-anchored cells: full span filter (wall vs stair/bump);
+        # floating cells: small span filter just to reject single-voxel noise
+        span_ok = np.where(near_ground,
+                           z_span >= config.min_wall_span_m,
+                           z_span >= config.floating_min_span_m)
+        obstacle = has_occ & span_ok
 
     if config.dilation_cells > 0 and np.any(obstacle):
         obstacle = binary_dilation(obstacle, iterations=config.dilation_cells)
     return obstacle
 
+
 @njit(cache=True)
 def generate_trajectory_library_3d(
-    num_samples=15, duration=3.0, dt=0.1,
+    num_samples=11, duration=5.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """Regular sampled lattice (forward-only)."""
@@ -226,7 +251,7 @@ def generate_trajectory_library_3d(
 
 
 def generate_predefined_trajectory_vocabularies(
-    duration=3.0, dt=0.1,
+    duration=5.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """
@@ -253,6 +278,7 @@ def generate_predefined_trajectory_vocabularies(
     params.append(np.array([-reverse_speed, 0.0], dtype=np.float64))
 
     return np.asarray(trajectories), np.asarray(params)
+
 
 @njit(cache=True)
 def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safety_radius=0.1,
@@ -323,6 +349,7 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
         occ_points.append(closest_step_for_traj)
     return scores, occ_points
 
+
 def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
     shift_m = new_origin - old_origin
     shift_voxels = np.round(shift_m / resolution).astype(int)
@@ -348,9 +375,15 @@ def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
 
 # === PlanningNode class ===
 class PlanningNode(Node):
-    def __init__(self):
-        super().__init__('planning_node')
-        self.robot = GO2_CONFIG
+    """Occupancy-grid + ESDF + trajectory-library planner.
+
+    Cost = clearance + distance-to-goal + smoothness, subject to a hard
+    collision filter and a reverse gate.
+    """
+
+    def __init__(self, node_name='planning_node'):
+        super().__init__(node_name)
+        self.robot = B2_CONFIG
         self.get_logger().info(
             f"Robot: {self.robot.name} ({self.robot.shape} {self.robot.length}x{self.robot.width}m, "
             f"cam=({self.robot.camera_x},{self.robot.camera_y}), "
@@ -372,16 +405,26 @@ class PlanningNode(Node):
         self.ts.registerCallback(self.sync_callback)
         self.camerainfo_sub = self.create_subscription(CameraInfo, '/camera/camera/infra2/camera_info', self.info_callback, 10)
 
-        self.grid_shape = (100, 100, 10)
-        self.resolution = 0.1
+        self.resolution = 0.05
+        self.obstacle_config = ObstacleConfig()
+        # Derive the grid's z extent and vertical offset from the obstacle band so
+        # the grid covers exactly [robot_z_bottom, robot_z_top] relative to the camera.
+        z_layers = int(round((self.obstacle_config.robot_z_top - self.obstacle_config.robot_z_bottom) / self.resolution))
+        self.grid_shape = (100, 100, z_layers)
+        self.z_grid_drop = -(self.obstacle_config.robot_z_top + self.obstacle_config.robot_z_bottom) / 2
         self.origin = np.array(self.grid_shape) * self.resolution / -2.
         self.step = 10
+        # Visualization is expensive (full-grid point clouds, colormaps) and not
+        # needed every cycle. Publish it every Nth callback; the control path
+        # (obstacle map, scoring, trajectory) still runs every cycle.
+        self.declare_parameter('vis_every_n', 5)
+        self.vis_every_n = int(self.get_parameter('vis_every_n').value)
+        self._vis_counter = 0
         self.occupancy_grid = np.zeros(self.grid_shape)
         self.K = None
         self.baseline = None
         self.last_T = None
         self.last_param = (0.0, 0.0) # acc and gyro
-        self.obstacle_config = ObstacleConfig()
         self.stamp = None
         self.current_pose = None  # Store the latest pose from odometry
 
@@ -390,13 +433,40 @@ class PlanningNode(Node):
         self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
         self.target_pose = None
 
+        # Openness prior from map_node: min static obstacle-ESDF (m) over the upcoming
+        # global segment. Used to modulate safety_radius: tight in pinches, base in open.
+        self._safety_base = float(self.robot.safety_radius)
+        self._nav_openness = None
+        self._nav_openness_stamp_ns = None  # node-clock ns when openness was last received
+        self._openness_ttl_ns = int(2.0e9)  # openness older than this -> fall back to base
+        self.create_subscription(Float32, '/mapping/path_openness', self.path_openness_callback, 10)
+
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
+    # --- callbacks ---------------------------------------------------------
     def poi_change_callback(self, msg):
         self.target_pose = None
 
     def target_pose_callback(self, msg):
         self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+
+    def path_openness_callback(self, msg):
+        # Just record the prior + arrival time. The effective safety_radius is derived
+        # per planning cycle (see _effective_safety_radius) so it self-heals back to
+        # base when the openness stream stops, instead of freezing at the last value.
+        self._nav_openness = float(msg.data)
+        self._nav_openness_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _effective_safety_radius(self):
+        # Static openness prior (m) -> safety_radius. Tighten toward narrow corridors:
+        # safety = clip((openness - robot.width) * 0.75, base*0.75, base). Falls back to
+        # base when no openness has been received or the last one is stale.
+        b = self._safety_base
+        if self._nav_openness is None or self._nav_openness_stamp_ns is None:
+            return b
+        if self.get_clock().now().nanoseconds - self._nav_openness_stamp_ns > self._openness_ttl_ns:
+            return b
+        return min(b, max(b * 0.75, (self._nav_openness - self.robot.width) * 0.75))
 
     def info_callback(self, msg):
         if self.K is None:
@@ -546,6 +616,8 @@ class PlanningNode(Node):
     def sync_callback(self, depth_msg, odom_msg):
         if self.K is None:
             return
+        self._vis_counter += 1
+        vis_now = (self.vis_every_n > 0) and (self._vis_counter % self.vis_every_n == 0)
         with Timer(name='preprocess', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
             stamp = Time.from_msg(odom_msg.header.stamp).nanoseconds / 1e9
@@ -563,17 +635,19 @@ class PlanningNode(Node):
         with Timer(name='raycasting', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             center = self.origin + np.array(self.grid_shape) * self.resolution / 2
             robot_pos = T[:3, 3]
-            delta = robot_pos - center
+            target_center = robot_pos - np.array([0.0, 0.0, self.z_grid_drop])
+            delta = target_center - center
             if np.linalg.norm(delta) > .1:
-                new_center = robot_pos
+                new_center = target_center
                 new_origin = new_center - np.array(self.grid_shape) * self.resolution / 2
                 self.occupancy_grid, self.origin = roll_occupancy_grid(self.occupancy_grid, self.origin, new_origin, self.resolution)
             new_occ = run_raycasting_loopy(depth, T, self.grid_shape, fx, fy, cx, cy, self.origin, self.step, self.resolution)
-            self.occupancy_grid *= 0.99
+            self.occupancy_grid *= 0.995
             self.occupancy_grid += new_occ
             self.occupancy_grid = np.clip(self.occupancy_grid, -0.2, 0.2)
 
-            self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
+            if vis_now:
+                self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             obstacle_mask = build_obstacle_map(
@@ -582,12 +656,13 @@ class PlanningNode(Node):
             )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
 
-        with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
-            self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
-            self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
-            self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
-            self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
-            self.publish_footprint(T, depth_msg.header.stamp)
+        if vis_now:
+            with Timer(name='vis', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+                self.publish_3d_occupancy_cloud_with_esdf(self.occupancy_grid, ESDF_map, self.resolution, self.origin)
+                self.publish_height_map(T[:3,3], ESDF_map, depth_msg.header)
+                self.publish_2d_occupancy_grid(ESDF_map, self.origin, self.resolution, depth_msg.header.stamp, z_offset=self.grid_shape[2]*self.resolution/2)
+                self.publish_obstacle_mask(obstacle_mask, depth_msg.header.stamp)
+                self.publish_footprint(T, depth_msg.header.stamp)
 
         with Timer(name='traj gen', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             init_p = self.camera_to_robot_center(T)
@@ -601,39 +676,16 @@ class PlanningNode(Node):
 
         with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_len, rear_len, half_w = self.robot.footprint_from_control()
-            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, self.robot.safety_radius, front_len, rear_len, half_w)
-            top_k = 100
-            top_indices = np.argsort(scores, kind='stable')[:top_k]
+            safety_radius = self._effective_safety_radius()
+            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, safety_radius, front_len, rear_len, half_w)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             enter_threshold = 0.30
+            should_reverse = front_clearance <= enter_threshold
 
-            def cost_function(traj, param, score, target_pose):
-                # predefined backward trajectory penalty
-                is_backward_traj = param[0] < 0.0
-                should_reverse = front_clearance <= enter_threshold
-                reverse_gate_penalty = 0.0
-                if should_reverse and not is_backward_traj:
-                        reverse_gate_penalty = 1e9
-                elif not should_reverse and is_backward_traj:
-                        reverse_gate_penalty = 1e9
-
-                # regular trajectory penalty
-                traj_end = np.array(traj[-1,:3])
-                target_end = target_pose if target_pose is not None else traj_end
-                dist = np.linalg.norm(traj_end - target_end)
-
-                return score * 100000 + 100 * dist + 10 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + reverse_gate_penalty
-
-            top_k = 1
-            top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
-            self.last_param = params[top_indices[0]]
-
-            # path
-            path = Path()
-            path.header = depth_msg.header
-            path.header.frame_id = "world"
+            # Goal used in the cost function.
+            target = self.target_pose
 
             if self.target_pose is None:
                 return
@@ -641,6 +693,48 @@ class PlanningNode(Node):
             if all(s == float('inf') for s in scores):
                 self.get_logger().info('All trajectories in collision, stopping path.')
                 return
+
+            # --- Stage 1: hard feasibility filter ---
+            # Only genuinely binding constraints are filters; everything that is a
+            # soft margin stays in the cost (Stage 2). Two hard constraints:
+            #   - collision (score == inf): the footprint touches an obstacle.
+            #   - reverse gate: drive backward iff the corridor ahead is blocked.
+            # Clearance (ESDF < safety_radius) is NOT a hard filter: safety_radius
+            # is a margin, not a collision boundary, and a corridor narrower than
+            # the band forces every forward trajectory to intrude into it. Filtering
+            # those out leaves only trajectories that score 0 by leaving the mapped
+            # grid (treated as "clear"), so the robot veers into the unknown instead
+            # of through the corridor. Clearance is handled softly below instead.
+            # The reverse gate is lexicographic: prefer gate-matching trajectories,
+            # fall back to any non-colliding one so the robot never stalls outright.
+            non_collision = [i for i in range(len(trajectories)) if scores[i] != float('inf')]
+            gate_ok = lambda i: (params[i][0] < 0.0) == should_reverse
+            for candidate_filter in (gate_ok, lambda i: True):
+                feasible = [i for i in non_collision if candidate_filter(i)]
+                if feasible:
+                    break
+
+            # --- Stage 2: soft preference cost over the feasible set ---
+            # Distance to the goal (primary), clearance (prefer staying out of the
+            # safety band, but yield to progress when a corridor forces intrusion),
+            # and a smoothness term resisting command chatter.
+            def preference_cost(i):
+                traj, param = trajectories[i], params[i]
+                traj_end = np.array(traj[-1, :3])
+                target_end = target if target is not None else traj_end
+                dist = np.linalg.norm(traj_end - target_end)
+                smooth = abs(self.last_param[0] - param[0]) + abs(self.last_param[1] - param[1])
+                return (scores[i] * 100000
+                        + 100 * dist
+                        + 10 * smooth)
+
+            top_indices = [min(feasible, key=preference_cost)]
+            self.last_param = params[top_indices[0]]
+
+            # path
+            path = Path()
+            path.header = depth_msg.header
+            path.header.frame_id = "world"
 
             for i in top_indices:
                 for j in range(0, len(trajectories[i]), 10):
@@ -657,6 +751,7 @@ class PlanningNode(Node):
                     path.poses.append(pose)
             self.path_pub.publish(path)
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = PlanningNode()
@@ -667,6 +762,7 @@ def main(args=None):
         rclpy.shutdown()
     except KeyboardInterrupt:
         pass
+
 
 if __name__ == '__main__':
     main()

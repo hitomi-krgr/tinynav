@@ -9,6 +9,8 @@ from scipy.spatial.transform import Rotation as R
 import numpy as np
 import logging
 import time
+import os
+import json
 
 # Module-level logger for cases where self.get_logger() is not available
 logger = logging.getLogger(__name__)
@@ -26,37 +28,60 @@ class CmdVelControlNode(Node):
             [1, 0, 0, 0],
             [0, 0, 0, 1]]
         )
+        # Camera sits this far ahead of the control center; heading must be referenced
+        # at the control center or the short path lies behind the camera.
+        self.cam_forward_offset = 0.5
+        self.T_camera_to_control = self.T_robot_to_camera.copy()
+        self.T_camera_to_control[2, 3] = -self.cam_forward_offset  # back along camera +z (=forward)
         self.last_path_time = 0.0
         self.pose = None
         self.path = None
+        self._path_xy = None          # (N,2) cached path XY, updated in path_callback
+        self._path_pose_yaw = None    # (N,) cached per-pose forward heading
 
-        # === Control loop (ported from planning_node_compare style) ===
-        # Planner input is typically 7-10 Hz; over-driving cmd publish rate amplifies jitter.
         self.cmd_rate_hz = 12.0
-        # Use minima; actual stale thresholds are scaled by observed planner period.
+        # Minima; actual stale thresholds are scaled by observed planner period.
         self.path_stale_slow_s = 0.35
         self.path_stale_stop_s = 0.8
         self.path_stale_slow_factor = 3.5
         self.path_stale_stop_factor = 5.0
         self.max_linear_acc = 0.6   # m/s^2
         self.max_angular_acc = 0.8  # rad/s^2
-        self.max_angular_speed = 0.8  # rad/s
+        # Match the planner's omega range; capping below it widens turn radius.
+        self.max_angular_speed = float(np.pi / 3)  # rad/s, = planner omega max
         self.planner_dt = 0.1       # trajectory dt in planning_node
-        # planning_node publishes path with for j in range(..., step=10), so points are ~1.0 s apart.
-        self.path_pose_stride = 10
+        self.path_pose_stride = 10  # planning_node publishes every 10th point (~1.0 s)
         self.path_period_ema = 0.12
-        self.path_filter_tau = 0.30
-        self.lookahead_steps = 1
+        # Heading-drift control: PI on heading drift. I learns each device's constant
+        # open-loop yaw bias (zero steady-state error); P provides damping (do not set 0).
+        self.yaw_kp = 0.35             # proportional (damping) gain
+        self.yaw_bias_ki = 0.15        # integral gain: rad/s of bias per (rad*s) drift
+        self.yaw_bias_limit = 0.25     # clamp on the learned bias (rad/s)
+        # Optional seed for the integral; leave 0 for pure self-learning.
+        self.yaw_bias_seed = 0.0
+        self.drift_filter_tau = 0.15   # low-pass on drift before P/I
+        # Integrate only while the plan is roughly straight (feedforward near zero).
+        self.straight_ff_threshold = 0.05  # rad/s; |feedforward| below this == straight
+        self._yaw_bias_est = self.yaw_bias_seed  # learned bias / integral state (rad/s)
+        self._drift_lp = None          # low-passed drift state
+        # Persist the learned bias across runs. Env TINYNAV_CMDVEL_CALIB="" disables it.
+        self.calib_path = os.environ.get("TINYNAV_CMDVEL_CALIB",
+                                         os.path.join("tinynav_temp", "cmd_vel_calib.json"))
+        self.calib_save_period_s = 10.0
+        self._last_calib_save = time.monotonic()
+        self._load_calib()
         # Static-friction compensation: very small vx often cannot move the robot.
-        self.min_effective_linear_speed = 0.1
-        self.min_effective_angular_speed = 0.1
+        self.min_effective_linear_speed = 0.2
+        # Yaw deadzone; must stay below the per-device yaw bias we cancel.
+        self.min_effective_angular_speed = 0.03
         self.linear_engage_threshold = 0.04
         self.fixed_reverse_speed = 0.2
-        # Hack: if path first segment points far away from robot heading,
-        # rotate in place instead of publishing near-zero cmd_vel.
-        self.force_turn_heading_threshold = np.deg2rad(80.0)
+        # Max segment heading change still treated as a straight reverse (above = U-turn).
+        self.reverse_max_yaw = 0.35
 
         self.latest_cmd = Twist()
+        self.path_vyaw_ff = 0.0
+        self.is_backward_segment = False
         self.prev_cmd = Twist()
         self.last_cmd_pub_time = time.monotonic()
         self.last_path_update_time = None
@@ -84,11 +109,70 @@ class CmdVelControlNode(Node):
             # manual teleop can own /cmd_vel without being overwritten by zeros.
             self.cmd_pub.publish(Twist())
 
+    def _load_calib(self):
+        """Seed the bias estimator from the last persisted value, if any."""
+        if not self.calib_path:
+            return
+        try:
+            with open(self.calib_path) as f:
+                val = float(json.load(f)["yaw_bias"])
+            self._yaw_bias_est = float(np.clip(val, -self.yaw_bias_limit, self.yaw_bias_limit))
+            self.logger.info(
+                f"Loaded yaw-bias calibration {self._yaw_bias_est:+.4f} rad/s from {self.calib_path}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.logger.warning(f"Could not load yaw-bias calibration ({self.calib_path}): {e}")
+
+    def _save_calib(self, force=False):
+        """Persist the learned bias (throttled, atomic)."""
+        if not self.calib_path:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_calib_save) < self.calib_save_period_s:
+            return
+        self._last_calib_save = now
+        try:
+            os.makedirs(os.path.dirname(self.calib_path) or ".", exist_ok=True)
+            tmp = self.calib_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"yaw_bias": float(self._yaw_bias_est)}, f)
+            os.replace(tmp, self.calib_path)
+        except Exception as e:
+            self.logger.warning(f"Could not save yaw-bias calibration ({self.calib_path}): {e}")
+
     def pose_callback(self, msg):
         self.pose = msg
 
     def _clamp_step(self, target: float, current: float, max_delta: float) -> float:
         return float(np.clip(target - current, -max_delta, max_delta) + current)
+
+    @staticmethod
+    def _pose_to_T(pose_msg) -> np.ndarray:
+        T = np.eye(4)
+        position = pose_msg.pose.position
+        rot = pose_msg.pose.orientation
+        quat = [rot.x, rot.y, rot.z, rot.w]
+        T[:3, :3] = R.from_quat(quat).as_matrix()
+        T[:3, 3] = np.array([position.x, position.y, position.z]).ravel()
+        return T
+
+    def _actual_yaw(self):
+        """World heading of the robot's measured forward axis (odometry)."""
+        if self.pose is None:
+            return None
+        fwd = self._pose_to_T(self.pose.pose)[:3, :3] @ np.array([0.0, 0.0, 1.0])  # optical +z = forward
+        return float(np.arctan2(fwd[1], fwd[0]))
+
+    def _path_intended_yaw(self):
+        """World heading the plan intends here: forward axis of the published trajectory
+        pose nearest the control center. The reference for isolating open-loop drift."""
+        if self.pose is None or self.path is None or self._path_xy is None or len(self._path_xy) == 0:
+            return None
+        ctrl_xy = (self._pose_to_T(self.pose.pose) @ self.T_camera_to_control)[:2, 3]
+        d2 = np.sum((self._path_xy - ctrl_xy) ** 2, axis=1)
+        best_i = int(np.argmin(d2))
+        return float(self._path_pose_yaw[best_i])
 
     def cmd_timer_callback(self):
         now = time.monotonic()
@@ -109,7 +193,35 @@ class CmdVelControlNode(Node):
         stale_stop_s = max(self.path_stale_stop_s, self.path_period_ema * self.path_stale_stop_factor)
         target_cmd = Twist()
         target_cmd.linear.x = self.latest_cmd.linear.x
-        target_cmd.angular.z = self.latest_cmd.angular.z
+
+        # Yaw = planner feedforward omega minus the learned per-device yaw bias, where
+        # the bias is integrated from the heading drift (measured vs plan-intended).
+        intended_yaw = self._path_intended_yaw()
+        actual_yaw = self._actual_yaw()
+        if intended_yaw is not None and actual_yaw is not None:
+            drift = float(np.arctan2(np.sin(actual_yaw - intended_yaw),
+                                     np.cos(actual_yaw - intended_yaw)))
+            # Low-pass the drift: intended_yaw comes from a sparse path and step-jumps
+            # when the nearest pose changes, which would corrupt the integral.
+            if self._drift_lp is None:
+                self._drift_lp = drift
+            else:
+                a = dt / (self.drift_filter_tau + dt)
+                self._drift_lp += a * (drift - self._drift_lp)
+            # Learn the bias only on straight, fresh, forward segments (windup guard).
+            straight = abs(self.path_vyaw_ff) < self.straight_ff_threshold
+            if straight and age < stale_slow_s and not self.is_backward_segment:
+                self._yaw_bias_est += self.yaw_bias_ki * self._drift_lp * dt
+                self._yaw_bias_est = float(np.clip(self._yaw_bias_est,
+                                                   -self.yaw_bias_limit, self.yaw_bias_limit))
+                self._save_calib()   # throttled; persists the live estimate
+            vyaw = self.path_vyaw_ff - (self.yaw_kp * self._drift_lp + self._yaw_bias_est)
+        else:
+            # No path/pose yet: feedforward minus the bias learned so far.
+            self._drift_lp = None
+            vyaw = self.path_vyaw_ff - self._yaw_bias_est
+        target_cmd.angular.z = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
+
         if age > stale_stop_s:
             target_cmd.linear.x = 0.0
             target_cmd.angular.z = 0.0
@@ -120,8 +232,7 @@ class CmdVelControlNode(Node):
         out = Twist()
         out.linear.y = 0.0
 
-        # Reverse is a predefined planner vocabulary: straight back at fixed speed.
-        # Do not smooth or re-lock it here; just pass it through while stale/paused guards still work.
+        # Reverse is a fixed-speed straight-back vocabulary; pass it through unsmoothed.
         if target_cmd.linear.x < 0.0:
             out.linear.x = target_cmd.linear.x
             out.angular.z = 0.0
@@ -129,19 +240,18 @@ class CmdVelControlNode(Node):
             self.prev_cmd = out
             return
 
-        # Forward/turning commands still get acceleration limiting and robot minimum-speed locks.
+        # Forward/turning commands get acceleration limiting and minimum-speed locks.
         max_dv = self.max_linear_acc * dt
-        # If we just left reverse mode, do not let acceleration limiting leak another reverse command.
+        # Just left reverse: don't let acceleration limiting leak another reverse command.
         prev_linear_x = 0.0 if self.prev_cmd.linear.x < 0.0 else self.prev_cmd.linear.x
         out.linear.x = self._clamp_step(target_cmd.linear.x, prev_linear_x, max_dv)
-        # Do not acceleration-limit yaw. The planner/control layer already decides the turn rate,
-        # and forced rotate-in-place should take effect immediately.
+        # Don't acceleration-limit yaw; the turn rate is already decided upstream.
         out.angular.z = float(np.clip(target_cmd.angular.z, -self.max_angular_speed, self.max_angular_speed))
 
-        # Linear x: robot cannot execute tiny non-zero speeds reliably.
-        # When engaging forward motion, snap to +min; when stopping/decaying, snap to 0.
+        # Tiny non-zero forward speeds aren't executable: creep at +min for any positive
+        # target (else the robot freezes and deadlocks); non-positive target decays to 0.
         if 0.0 < out.linear.x < self.min_effective_linear_speed:
-            out.linear.x = self.min_effective_linear_speed if target_cmd.linear.x >= self.min_effective_linear_speed else 0.0
+            out.linear.x = self.min_effective_linear_speed if target_cmd.linear.x > 0.0 else 0.0
         elif abs(out.linear.x) < self.min_effective_linear_speed:
             out.linear.x = 0.0
 
@@ -164,6 +274,20 @@ class CmdVelControlNode(Node):
             return
         self.path = msg
 
+        # Cache path XY and per-pose forward heading so _path_intended_yaw (called at
+        # cmd_rate_hz) is a vectorized argmin instead of a Python loop over poses with
+        # a scipy Rotation build per pose. Forward (optical +z) heading from quaternion:
+        #   fwd_x = 2(xz + wy), fwd_y = 2(yz - wx).
+        px = np.array([p.pose.position.x for p in msg.poses])
+        py = np.array([p.pose.position.y for p in msg.poses])
+        qx = np.array([p.pose.orientation.x for p in msg.poses])
+        qy = np.array([p.pose.orientation.y for p in msg.poses])
+        qz = np.array([p.pose.orientation.z for p in msg.poses])
+        qw = np.array([p.pose.orientation.w for p in msg.poses])
+        self._path_xy = np.stack([px, py], axis=1)
+        self._path_pose_yaw = np.arctan2(2.0 * (qy * qz - qw * qx),
+                                         2.0 * (qx * qz + qw * qy))
+
         ros_now = self.get_clock().now().to_msg()
         self.last_path_time = ros_now.sec + ros_now.nanosec * 1e-9
         now_mono = time.monotonic()
@@ -172,66 +296,48 @@ class CmdVelControlNode(Node):
             self.path_period_ema = 0.85 * self.path_period_ema + 0.15 * float(period)
         self.last_path_update_time = now_mono
 
-        def msg2np(msg):
-            T = np.eye(4)
-            position = msg.pose.position
-            rot = msg.pose.orientation
-            quat = [rot.x, rot.y, rot.z, rot.w]
-            T[:3, :3] = R.from_quat(quat).as_matrix()
-            T[:3, 3] = np.array([position.x, position.y, position.z]).ravel()
-            return T
-        
-        T1 = msg2np(self.path.poses[0])
-        step_idx = int(min(self.lookahead_steps, len(self.path.poses) - 1))
-        T2 = msg2np(self.path.poses[step_idx])
-        T_robot_1 = T1 @ self.T_robot_to_camera
-        T_robot_2 = T2 @ self.T_robot_to_camera
+        # Reproduce the planner's instantaneous (v, omega) from the first published step
+        # (pose0 -> pose1), not a far lookahead chord which can misfire as reverse.
+        T_robot_1 = self._pose_to_T(self.path.poses[0]) @ self.T_robot_to_camera
+        T_robot_2 = self._pose_to_T(self.path.poses[1]) @ self.T_robot_to_camera
         T_robot_2_to_1 = np.linalg.inv(T_robot_1) @ T_robot_2
-        p = T_robot_2_to_1[:3, 3]
-        heading_err = float(np.arctan2(p[1], p[0]))
-        # dt must match actual spacing between published Path poses, not raw trajectory dt.
-        dt = self.planner_dt * self.path_pose_stride * max(1, step_idx)
-        linear_velocity_vec = p / dt
-        r = R.from_matrix(T_robot_2_to_1[:3, :3])
-        angular_velocity_vec = r.as_rotvec() / dt
+        disp = T_robot_2_to_1[:3, 3]
+        dt = self.planner_dt * self.path_pose_stride        # one published step (~1.0 s)
+        seg_yaw_change = float(R.from_matrix(T_robot_2_to_1[:3, :3]).as_rotvec()[2])
 
-        raw_vx = float(linear_velocity_vec[0])
-        if raw_vx < 0.0:
+        # Body-forward speed is the tangential (arc-length) speed, not the chord's
+        # x-projection. Signed by forward direction so a reverse step reads negative.
+        fwd_sign = 1.0 if disp[0] >= 0.0 else -1.0
+        raw_vx = fwd_sign * float(np.hypot(disp[0], disp[1])) / dt
+        vyaw_seg = seg_yaw_change / dt
+
+        # Reverse = straight-back vocabulary (vx<0, omega=0); the yaw guard rejects
+        # backward-projecting forward arcs.
+        is_backward_segment = raw_vx < 0.0 and abs(seg_yaw_change) < self.reverse_max_yaw
+        if is_backward_segment:
             vx = -self.fixed_reverse_speed
         else:
-            vx = float(np.clip(raw_vx, 0.0, 0.5))
-        vy = 0.0
-        vyaw = np.clip(angular_velocity_vec[2], -self.max_angular_speed, self.max_angular_speed)
-        is_backward_segment = raw_vx < 0.0
-        if is_backward_segment:
-            vyaw = 0.0
+            vx = float(np.clip(raw_vx, 0.0, 0.4))
+            # Preserve turn radius (vx/omega) when omega exceeds the cap: scale vx by the
+            # same ratio instead of just clipping omega (which would widen the radius).
+            if abs(vyaw_seg) > self.max_angular_speed:
+                vx *= self.max_angular_speed / abs(vyaw_seg)
+                vyaw_seg = float(np.sign(vyaw_seg) * self.max_angular_speed)
 
-        # Hack: if path first segment points >80 deg away from robot heading,
-        # force an in-place turn. Skip explicit backward segments because reverse
-        # naturally has heading_err close to +/-pi.
-        if (not is_backward_segment) and abs(heading_err) > self.force_turn_heading_threshold:
-            vx = 0.0
-            vyaw = float(np.clip(heading_err, -self.max_angular_speed, self.max_angular_speed))
-        # Minimal rotate-first gate: apply only for forward motion.
-        elif vx > 0.0 and abs(heading_err) > 0.45:
-            vx = 0.0
-            vyaw = float(np.clip(1.6 * heading_err, -0.6, 0.6))
-
-        vyaw = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
-
-        # Store the latest target command directly. Smoothing is intentionally kept
-        # only in cmd_timer_callback via acceleration limiting, so planner/control
-        # behavior stays easy to reason about during tuning.
+        # Feedforward yaw rate; the heading-drift PI is applied per-tick in the timer.
+        self.is_backward_segment = is_backward_segment
+        self.path_vyaw_ff = 0.0 if is_backward_segment else vyaw_seg
         self.latest_cmd.linear.x = float(vx)
-        self.latest_cmd.linear.y = float(vy)
-        self.latest_cmd.angular.z = float(vyaw)
+        self.latest_cmd.linear.y = 0.0
         age = 0.0 if self.last_path_update_time is None else (time.monotonic() - self.last_path_update_time)
         self.logger.debug(
-            f"cmd vx={self.latest_cmd.linear.x:.3f} vyaw={self.latest_cmd.angular.z:.3f} "
-            f"path_age={age:.2f}s path_dt_ema={self.path_period_ema:.2f}s lookahead={step_idx}"
+            f"path target_vx={self.latest_cmd.linear.x:.3f} vyaw_ff={self.path_vyaw_ff:.3f} "
+            f"backward={self.is_backward_segment} seg_yaw={seg_yaw_change:+.3f} "
+            f"path_age={age:.2f}s path_dt_ema={self.path_period_ema:.2f}s"
         )
 
     def destroy_node(self):
+        self._save_calib(force=True)
         self.logger.info("Destroying cmd_vel_control connection.")
         super().destroy_node()
         
