@@ -421,16 +421,31 @@ class BackendNode(Ros2NodeManager):
     def _detect_and_init_sensor(self):
         domain = os.environ.get('ROS_DOMAIN_ID', '0')
         self.get_logger().info(f'BackendNode ROS_DOMAIN_ID={domain}')
-        try:
-            result = subprocess.run(
-                ['ros2', 'node', 'list'], capture_output=True, text=True, timeout=3
+
+        # Explicit override: when TINYNAV_SENSOR_MODE is set, honor it verbatim and
+        # skip node-based detection. Avoids misdetecting a looper rig as realsense when
+        # /insight_full is slow to come up (the looper bridge just subscribes and waits).
+        forced = os.environ.get('TINYNAV_SENSOR_MODE', '').strip().lower()
+        if forced and forced not in ('looper', 'realsense'):
+            self.get_logger().warn(
+                f'Ignoring invalid TINYNAV_SENSOR_MODE={forced!r}; falling back to detection'
             )
-            if '/insight_full' in result.stdout.splitlines():
-                self._sensor_mode = 'looper'
-                self.get_logger().info('Sensor mode: looper — launching looper bridge + planning')
+            forced = ''
+
+        try:
+            if forced:
+                self._sensor_mode = forced
+                self.get_logger().info(f'Sensor mode: {forced} (forced via TINYNAV_SENSOR_MODE)')
             else:
-                self._sensor_mode = 'realsense'
-                self.get_logger().info('Sensor mode: realsense — launching driver + perception + planning')
+                result = subprocess.run(
+                    ['ros2', 'node', 'list'], capture_output=True, text=True, timeout=3
+                )
+                if '/insight_full' in result.stdout.splitlines():
+                    self._sensor_mode = 'looper'
+                    self.get_logger().info('Sensor mode: looper — launching looper bridge + planning')
+                else:
+                    self._sensor_mode = 'realsense'
+                    self.get_logger().info('Sensor mode: realsense — launching driver + perception + planning')
 
             if self._sensor_mode in ('looper', 'realsense'):
                 _env = os.environ.copy()
