@@ -9,6 +9,7 @@ services:
     tty: true
     environment:
       FRONTEND_PORT: 8080
+      TINYNAV_SENSOR_MODE: looper
       UV_PROJECT_ENVIRONMENT: /opt/venv
       OPENBLAS_NUM_THREADS: 1
     volumes:
