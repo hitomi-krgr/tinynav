@@ -49,15 +49,25 @@ class CmdVelControlNode(Node):
         # Hardware execution limit, independent of the planner's own sampling range.
         self.max_angular_speed = float(np.pi / 3)  # rad/s
         self.path_period_ema = 0.12
-        # Heading-drift control: PI on heading drift. I learns each device's constant
-        # open-loop yaw bias (zero steady-state error); P provides damping (do not set 0).
-        self.yaw_kp = 0.35             # proportional (damping) gain
-        self.yaw_bias_ki = 0.15        # integral gain: rad/s of bias per (rad*s) drift
-        self.yaw_bias_limit = 0.25     # clamp on the learned bias (rad/s)
+        # Heading-drift control: PI on heading drift. I learns each device's open-loop
+        # yaw bias (zero steady-state error); P provides damping (do not set 0).
+        # The bias is stored per-metre-travelled (rad/m), not rad/s: the drift is a
+        # distance-driven asymmetry, so its rad/s contribution scales with vx. Learning
+        # divides by vx and application multiplies by the current vx, so a bias learned
+        # on fast straight segments self-scales down on slow turns instead of over-rotating.
+        self.yaw_kp = 0.35             # proportional (damping) gain (rad/s per rad)
+        self.yaw_bias_ki = 0.15        # integral gain (see cmd_timer_callback)
+        self.yaw_bias_limit = 0.5      # clamp on the learned bias (rad/m)
+        self.yaw_bias_min_vx = 0.15    # only learn/apply the bias above this forward speed (m/s)
         # Integrate only while the plan is roughly straight (feedforward near zero);
         # this also implies the path is fresh, since path_vyaw_ff comes from the latest path.
         self.straight_ff_threshold = 0.05  # rad/s; |feedforward| below this == straight
-        self._yaw_bias_est = 0.0       # learned bias / integral state (rad/s), relearned each run
+        self._yaw_bias_per_m = 0.0     # learned bias / integral state (rad/m), relearned each run
+        # Low-pass the drift before P/I: intended_yaw comes from a sparse path and
+        # step-jumps when the nearest pose changes, which would otherwise inject a
+        # spike into the P term and corrupt the integral.
+        self.drift_filter_tau = 0.15   # s
+        self._drift_lp = None          # low-passed drift state (rad)
         # Static-friction compensation: very small vx often cannot move the robot.
         self.min_effective_linear_speed = 0.2
         # Yaw deadzone; must stay below the per-device yaw bias we cancel.
@@ -152,20 +162,32 @@ class CmdVelControlNode(Node):
         # the bias is integrated from the heading drift (measured vs plan-intended).
         intended_yaw = self._path_intended_yaw()
         actual_yaw = self._actual_yaw()
+        vx_now = float(self.latest_cmd.linear.x)
+        # rad/m bias -> rad/s correction at the current speed; zero when stopped.
+        bias_rate = self._yaw_bias_per_m * vx_now if vx_now > self.yaw_bias_min_vx else 0.0
         if intended_yaw is not None and actual_yaw is not None:
             drift = float(np.arctan2(np.sin(actual_yaw - intended_yaw),
                                      np.cos(actual_yaw - intended_yaw)))
-            # Learn the bias only on straight, non-backward segments (windup guard);
-            # "straight" also implies fresh, since path_vyaw_ff comes from the latest path.
+            # Low-pass the raw drift before it feeds P/I (see drift_filter_tau).
+            if self._drift_lp is None:
+                self._drift_lp = drift
+            else:
+                a = dt / (self.drift_filter_tau + dt)
+                self._drift_lp += a * (drift - self._drift_lp)
+            # Learn the bias only on straight, non-backward segments moving fast enough
+            # that vx is a reliable divisor (windup guard). "straight" also implies fresh,
+            # since path_vyaw_ff comes from the latest path. Integrate in rad/m: divide the
+            # rad/s drift update by vx so the estimate is speed-independent.
             straight = abs(self.path_vyaw_ff) < self.straight_ff_threshold
-            if straight and not self.is_backward_segment:
-                self._yaw_bias_est += self.yaw_bias_ki * drift * dt
-                self._yaw_bias_est = float(np.clip(self._yaw_bias_est,
-                                                   -self.yaw_bias_limit, self.yaw_bias_limit))
-            vyaw = self.path_vyaw_ff - (self.yaw_kp * drift + self._yaw_bias_est)
+            if straight and not self.is_backward_segment and vx_now > self.yaw_bias_min_vx:
+                self._yaw_bias_per_m += self.yaw_bias_ki * self._drift_lp * dt / vx_now
+                self._yaw_bias_per_m = float(np.clip(self._yaw_bias_per_m,
+                                                     -self.yaw_bias_limit, self.yaw_bias_limit))
+            vyaw = self.path_vyaw_ff - (self.yaw_kp * self._drift_lp + bias_rate)
         else:
             # No path/pose yet: feedforward minus the bias learned so far.
-            vyaw = self.path_vyaw_ff - self._yaw_bias_est
+            self._drift_lp = None
+            vyaw = self.path_vyaw_ff - bias_rate
         target_cmd.angular.z = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
 
         if age > stale_stop_s:
@@ -255,7 +277,7 @@ class CmdVelControlNode(Node):
         if is_backward_segment:
             vx = -self.fixed_reverse_speed
         else:
-            vx = float(np.clip(raw_vx, 0.0, 0.4))
+            vx = float(np.clip(raw_vx, 0.0, 0.5))
             # Preserve turn radius (vx/omega) when omega exceeds the cap: scale vx by the
             # same ratio instead of just clipping omega (which would widen the radius).
             if abs(vyaw) > self.max_angular_speed:

@@ -17,7 +17,7 @@ from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import Image, CameraInfo, PointField, PointCloud2, PointCloud
 from nav_msgs.msg import Path, Odometry, OccupancyGrid
-from geometry_msgs.msg import PoseStamped, Point32
+from geometry_msgs.msg import PoseStamped, Point32, Twist
 from std_msgs.msg import Header, Float32
 from cv_bridge import CvBridge
 import sensor_msgs_py.point_cloud2 as pc2
@@ -392,6 +392,10 @@ class PlanningNode(Node):
         )
         self.bridge = CvBridge()
         self.path_pub = self.create_publisher(Path, '/planning/trajectory_path', 10)
+        # Instantaneous (vx, omega) feedforward of the selected trajectory. cmd_vel_control
+        # consumes this directly instead of reverse-engineering it from path poses.
+        # angular.x is a backward-segment flag (fixed-speed reverse vocabulary).
+        self.velocity_ff_pub = self.create_publisher(Twist, '/planning/velocity_ff', 10)
         self.height_map_pub = self.create_publisher(Image, "/planning/height_map", 10)
         self.obstacle_mask_pub = self.create_publisher(OccupancyGrid, '/planning/obstacle_mask', 10)
         self.footprint_pub = self.create_publisher(PointCloud, '/planning/footprint', 10)
@@ -730,6 +734,17 @@ class PlanningNode(Node):
 
             top_indices = [min(feasible, key=preference_cost)]
             self.last_param = params[top_indices[0]]
+
+            # velocity feedforward for cmd_vel_control: (vx, omega) of the selected
+            # trajectory, straight from its lattice params. Backward segments are the
+            # fixed-speed reverse vocabulary, flagged via angular.x (the controller
+            # substitutes its own reverse speed and zeroes omega).
+            sel_vx, sel_omega = float(params[top_indices[0]][0]), float(params[top_indices[0]][1])
+            ff = Twist()
+            ff.linear.x = sel_vx
+            ff.angular.z = sel_omega
+            ff.angular.x = 1.0 if sel_vx < 0.0 else 0.0
+            self.velocity_ff_pub.publish(ff)
 
             # path
             path = Path()
