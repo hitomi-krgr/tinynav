@@ -736,10 +736,26 @@ class PlanningNode(Node):
             self.last_param = params[top_indices[0]]
 
             # velocity feedforward for cmd_vel_control: (vx, omega) of the selected
-            # trajectory, straight from its lattice params. Backward segments are the
-            # fixed-speed reverse vocabulary, flagged via angular.x (the controller
-            # substitutes its own reverse speed and zeroes omega).
-            sel_vx, sel_omega = float(params[top_indices[0]][0]), float(params[top_indices[0]][1])
+            # trajectory. vx is the commanded body-forward speed (lattice param; its
+            # sign flags the fixed-speed reverse vocabulary via angular.x). omega is
+            # NOT taken from the lattice param -- that omega is about the camera optical
+            # axis and would need a hand-maintained sign/frame correction. Instead we
+            # derive the yaw rate straight from the trajectory's own world poses, using
+            # the same body-+z-forward convention as score_trajectories_by_ESDF and the
+            # published Path: angular.z = d(world heading)/dt over the first step. This
+            # stays consistent with the path by construction and is correct even if the
+            # camera pitches (where -omega_y would be subtly wrong).
+            sel_traj = trajectories[top_indices[0]]
+            sel_vx = float(params[top_indices[0]][0])
+            traj_dt = 0.1  # matches generate_trajectory_library_3d / vocab dt
+
+            def _world_heading(pose7):
+                qx, qy, qz, qw = pose7[3], pose7[4], pose7[5], pose7[6]
+                return np.arctan2(2.0 * (qy * qz - qw * qx), 2.0 * (qx * qz + qw * qy))
+
+            dh = _world_heading(sel_traj[1]) - _world_heading(sel_traj[0])
+            sel_omega = float(np.arctan2(np.sin(dh), np.cos(dh)) / traj_dt)
+
             ff = Twist()
             ff.linear.x = sel_vx
             ff.angular.z = sel_omega
