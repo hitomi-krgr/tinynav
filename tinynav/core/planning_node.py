@@ -58,7 +58,7 @@ class RobotConfig:
 
 GO2_CONFIG = RobotConfig(
     name='go2', shape='square',
-    length=0.7, width=0.3,
+    length=0.6, width=0.3,
     camera_x=0.2, camera_y=0.0,
     control_x=0.0, control_y=0.0,
     safety_radius=0.2,
@@ -383,7 +383,7 @@ class PlanningNode(Node):
 
     def __init__(self, node_name='planning_node'):
         super().__init__(node_name)
-        self.robot = B2_CONFIG
+        self.robot = GO2_CONFIG
         self.get_logger().info(
             f"Robot: {self.robot.name} ({self.robot.shape} {self.robot.length}x{self.robot.width}m, "
             f"cam=({self.robot.camera_x},{self.robot.camera_y}), "

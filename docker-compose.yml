@@ -8,10 +8,11 @@ services:
     stdin_open: true
     tty: true
     environment:
-      FRONTEND_PORT: 8080
+      FRONTEND_PORT: 80
       TINYNAV_SENSOR_MODE: looper
       UV_PROJECT_ENVIRONMENT: /opt/venv
       OPENBLAS_NUM_THREADS: 1
+      ROS_DOMAIN_ID: 0
     volumes:
       - .:/tinynav
       - ${HOME}/.local/share/tinynav:/root/.local/share/tinynav
