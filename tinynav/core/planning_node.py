@@ -58,7 +58,7 @@ class RobotConfig:
 
 GO2_CONFIG = RobotConfig(
     name='go2', shape='square',
-    length=0.6, width=0.3,
+    length=0.7, width=0.3,
     camera_x=0.2, camera_y=0.0,
     control_x=0.0, control_y=0.0,
     safety_radius=0.2,
@@ -159,12 +159,12 @@ def run_raycasting_loopy(depth_image, T_cam_to_world, grid_shape, fx, fy, cx, cy
 
 @dataclass
 class ObstacleConfig:
-    robot_z_bottom: float = -0.7
-    robot_z_top: float = 0.3
+    robot_z_bottom: float = -0.4
+    robot_z_top: float = 0.4
     occ_threshold: float = 0.1
     min_wall_span_m: float = 0.2
     ground_band_m: float = 0.3
-    floating_min_span_m: float = 0.05
+    floating_min_span_m: float = 0.1
     dilation_cells: int = 0
 
 
@@ -209,7 +209,7 @@ def build_obstacle_map(occupancy_grid, origin, resolution, robot_z, config=None)
 
 @njit(cache=True)
 def generate_trajectory_library_3d(
-    num_samples=11, duration=5.0, dt=0.1,
+    num_samples=15, duration=3.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """Regular sampled lattice (forward-only)."""
@@ -251,7 +251,7 @@ def generate_trajectory_library_3d(
 
 
 def generate_predefined_trajectory_vocabularies(
-    duration=5.0, dt=0.1,
+    duration=3.0, dt=0.1,
     init_p=np.zeros(3), init_q=np.array([0, 0, 0, 1])
 ):
     """
@@ -282,8 +282,13 @@ def generate_predefined_trajectory_vocabularies(
 
 @njit(cache=True)
 def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safety_radius=0.1,
-                                front_len=0.35, rear_len=0.35, half_w=0.15):
-    """Score trajectories by minimum ESDF clearance across the robot footprint (center + 4 corners)."""
+                                front_len=0.35, rear_len=0.35, half_w=0.15, check_steps=0):
+    """Score trajectories by minimum ESDF clearance across the robot footprint (center + 4 corners).
+
+    check_steps > 0 limits the collision/clearance scan to the first `check_steps`
+    poses (a receding-horizon "commit" window): a far-downrange collision no longer
+    vetoes the whole trajectory, so the robot can still commit to a path whose near
+    segment is clear and re-plan next cycle. check_steps <= 0 scans the full traj."""
     scores = []
     occ_points = []
     ESDF_rows, ESDF_cols = ESDF_map.shape
@@ -293,7 +298,10 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
         min_dist_for_traj = float('inf')
         closest_step_for_traj = -1
 
-        for i in range(len(traj)):
+        n_check = len(traj)
+        if check_steps > 0 and check_steps < n_check:
+            n_check = check_steps
+        for i in range(n_check):
             x_world, y_world = traj[i, 0], traj[i, 1]
             qx, qy, qz, qw = traj[i, 3], traj[i, 4], traj[i, 5], traj[i, 6]
 
@@ -424,6 +432,15 @@ class PlanningNode(Node):
         self.declare_parameter('vis_every_n', 5)
         self.vis_every_n = int(self.get_parameter('vis_every_n').value)
         self._vis_counter = 0
+        # Receding-horizon collision "commit" window (seconds). Hard collision is
+        # only checked over the first commit_horizon_s of each trajectory; a wall
+        # farther than that no longer vetoes the whole path, so the robot keeps
+        # advancing toward clutter and re-plans every cycle instead of freezing on
+        # the stay-put (vx=0) trajectory. <=0 disables (checks the full horizon).
+        self.declare_parameter('collision_horizon_s', 1.5)
+        self._traj_dt = 0.1  # matches generate_trajectory_library_3d / vocab dt
+        horizon_s = float(self.get_parameter('collision_horizon_s').value)
+        self._collision_check_steps = int(round(horizon_s / self._traj_dt)) if horizon_s > 0 else 0
         self.occupancy_grid = np.zeros(self.grid_shape)
         self.K = None
         self.baseline = None
@@ -681,7 +698,7 @@ class PlanningNode(Node):
         with Timer(name='traj score', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_len, rear_len, half_w = self.robot.footprint_from_control()
             safety_radius = self._effective_safety_radius()
-            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, safety_radius, front_len, rear_len, half_w)
+            scores, occ_points = score_trajectories_by_ESDF(trajectories, ESDF_map, self.origin, self.resolution, safety_radius, front_len, rear_len, half_w, self._collision_check_steps)
 
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
@@ -695,7 +712,19 @@ class PlanningNode(Node):
                 return
 
             if all(s == float('inf') for s in scores):
-                self.get_logger().info('All trajectories in collision, stopping path.')
+                # Diagnose WHERE it collides: is the robot's own footprint cell already
+                # an obstacle (phantom ground/self), or is it genuinely walled in?
+                center = self.camera_to_robot_center(T)
+                cxi = int((center[0] - self.origin[0]) / self.resolution)
+                cyi = int((center[1] - self.origin[1]) / self.resolution)
+                rows, cols = obstacle_mask.shape
+                center_obst = (0 <= cxi < rows and 0 <= cyi < cols and obstacle_mask[cxi, cyi])
+                self.get_logger().warn(
+                    f'All trajectories in collision. obst_cells={int(obstacle_mask.sum())} '
+                    f'center_cell_obstacle={center_obst} front_clearance={front_clearance:.2f} '
+                    f'ESDF@center={ESDF_map[cxi, cyi] if (0<=cxi<rows and 0<=cyi<cols) else -1:.2f} '
+                    f'should_reverse={should_reverse}'
+                )
                 return
 
             # --- Stage 1: hard feasibility filter ---
@@ -734,6 +763,15 @@ class PlanningNode(Node):
 
             top_indices = [min(feasible, key=preference_cost)]
             self.last_param = params[top_indices[0]]
+
+            # Confirm what actually got selected: if vx≈0 while feasible forward
+            # trajectories exist, the robot is "stuck by cost", not by collision.
+            n_fwd_feasible = sum(1 for i in feasible if params[i][0] > 1e-3)
+            self.get_logger().info(
+                f'sel vx={params[top_indices[0]][0]:.2f} omega={params[top_indices[0]][1]:.2f} '
+                f'feasible={len(feasible)} fwd_feasible={n_fwd_feasible} '
+                f'should_reverse={should_reverse} check_steps={self._collision_check_steps}'
+            )
 
             # velocity feedforward for cmd_vel_control: (vx, omega) of the selected
             # trajectory. vx is the commanded body-forward speed (lattice param; its
