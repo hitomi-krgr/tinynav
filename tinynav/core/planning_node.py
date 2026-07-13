@@ -482,6 +482,20 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
+        # Warm up the stair-carveout numba kernel now (a ~0.4s one-time JIT
+        # compile) so the first real planning cycle isn't stalled by it. A dummy
+        # zero grid triggers compilation by argument type -- the same dtypes the
+        # live call uses -- regardless of data content.
+        if self.use_stair_carveout:
+            detect_stair_carveout(
+                np.zeros(self.grid_shape), self.origin, self.resolution,
+                robot_z=0.0, forward_xy=np.array([1.0, 0.0]), center_cell=(0, 0),
+                zspan_mask=np.zeros(self.grid_shape[:2], dtype=bool),
+                cfg=self.stair_config,
+                fallback_drop=-self.obstacle_config.robot_z_bottom,
+            )
+            self.get_logger().info('stair-carveout kernel warmed up')
+
     # --- callbacks ---------------------------------------------------------
     def poi_change_callback(self, msg):
         self.target_pose = None
