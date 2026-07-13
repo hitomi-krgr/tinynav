@@ -8,7 +8,7 @@ to a hard collision filter and a reverse gate.
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_dilation
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numba import njit
 import cv2
 import rclpy
@@ -23,6 +23,7 @@ from cv_bridge import CvBridge
 import sensor_msgs_py.point_cloud2 as pc2
 from codetiming import Timer
 from tinynav.core.math_utils import rotvec_to_matrix, quat_to_matrix, matrix_to_quat, msg2np
+from tinynav.core.stair_detect import StairConfig, detect_stair_carveout
 
 
 @dataclass
@@ -419,6 +420,23 @@ class PlanningNode(Node):
 
         self.resolution = 0.05
         self.obstacle_config = ObstacleConfig()
+        # Stair/step carve-out: run z-span at a LOW span threshold so it blocks
+        # every low protrusion (low obstacles AND stair risers), then subtract
+        # cells confirmed to be a genuine step/ramp so the robot can drive onto
+        # them (low-level locomotion handles the climb). Default off; A/B against
+        # pure z-span with `use_stair_carveout:=true`.
+        self.declare_parameter('use_stair_carveout', False)
+        self.use_stair_carveout = bool(self.get_parameter('use_stair_carveout').value)
+        # climb_step_max is a placeholder until the real robot step capability is
+        # known; z band matches the planning grid's obstacle band.
+        self.stair_config = StairConfig(
+            occ_threshold=self.obstacle_config.occ_threshold,
+            z_lo_rel=self.obstacle_config.robot_z_bottom,
+            z_hi_rel=self.obstacle_config.robot_z_top,
+            climb_step_max=0.20,
+        )
+        # Conservative span used only when carve-out is on (blocks low obstacles).
+        self._carveout_span_m = 0.08
         # Derive the grid's z extent and vertical offset from the obstacle band so
         # the grid covers exactly [robot_z_bottom, robot_z_top] relative to the camera.
         z_layers = int(round((self.obstacle_config.robot_z_top - self.obstacle_config.robot_z_bottom) / self.resolution))
@@ -671,10 +689,31 @@ class PlanningNode(Node):
                 self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
-            obstacle_mask = build_obstacle_map(
-                self.occupancy_grid, self.origin, self.resolution,
-                robot_z=T[2, 3], config=self.obstacle_config,
-            )
+            if self.use_stair_carveout:
+                # Conservative baseline: low span threshold blocks every low
+                # protrusion (obstacles AND stair risers).
+                cfg = replace(self.obstacle_config, min_wall_span_m=self._carveout_span_m)
+                obstacle_mask = build_obstacle_map(
+                    self.occupancy_grid, self.origin, self.resolution,
+                    robot_z=T[2, 3], config=cfg,
+                )
+                # Subtract cells confirmed to be a climbable step/ramp.
+                center = self.camera_to_robot_center(T)
+                ci = int((center[0] - self.origin[0]) / self.resolution)
+                cj = int((center[1] - self.origin[1]) / self.resolution)
+                fwd = T[:3, :3] @ np.array([0.0, 0.0, 1.0])  # camera optical axis = forward
+                carve = detect_stair_carveout(
+                    self.occupancy_grid, self.origin, self.resolution,
+                    robot_z=T[2, 3], forward_xy=fwd[:2], center_cell=(ci, cj),
+                    zspan_mask=obstacle_mask, cfg=self.stair_config,
+                    fallback_drop=-self.obstacle_config.robot_z_bottom,
+                )
+                obstacle_mask = obstacle_mask & ~carve
+            else:
+                obstacle_mask = build_obstacle_map(
+                    self.occupancy_grid, self.origin, self.resolution,
+                    robot_z=T[2, 3], config=self.obstacle_config,
+                )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
 
         if vis_now:
