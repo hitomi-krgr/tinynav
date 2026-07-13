@@ -27,6 +27,7 @@ connectivity 'walkable' layer under reflections).
 from dataclasses import dataclass
 
 import numpy as np
+from numba import njit
 from scipy.ndimage import label
 
 
@@ -78,6 +79,55 @@ def estimate_base_floor(height, center_cell, radius_cells, robot_z, fallback_dro
     return float(-fallback_drop)
 
 
+@njit(cache=True)
+def _carve_kernel(height, elevated, candidate, floor, di_f, dj_f, latv0, latv1,
+                  n_fwd, n_lat, return_tol, climb_step_max):
+    """Per-candidate forward-profile + lateral-extent test (hot loop).
+
+    For each elevated obstacle candidate cell: carve it iff the surface ahead
+    stays elevated (never returns to floor within the forward window) rising in
+    climb-sized steps, AND the elevation spans the lateral corridor band."""
+    nx, ny = height.shape
+    carve = np.zeros((nx, ny), dtype=np.bool_)
+    for i in range(nx):
+        for j in range(ny):
+            if not candidate[i, j]:
+                continue
+            # (a) SUSTAINED forward: not returning to floor, climb-sized rises.
+            sustained = True
+            prev = height[i, j]
+            for s in range(1, n_fwd + 1):
+                ai = int(round(i + di_f * s))
+                aj = int(round(j + dj_f * s))
+                if ai < 0 or ai >= nx or aj < 0 or aj >= ny:
+                    sustained = False
+                    break
+                ha = height[ai, aj]
+                if ha != ha:                    # NaN: unknown ahead, skip
+                    continue
+                if ha <= floor + return_tol:    # returned to floor -> bump, not step
+                    sustained = False
+                    break
+                if ha - prev > climb_step_max:  # too-tall single jump -> wall
+                    sustained = False
+                    break
+                if ha > prev:
+                    prev = ha
+            if not sustained:
+                continue
+            # (b) LATERAL EXTENT across the corridor.
+            lat_hits = 0
+            for t in range(-n_lat, n_lat + 1):
+                li = int(round(i + latv0 * t))
+                lj = int(round(j + latv1 * t))
+                if 0 <= li < nx and 0 <= lj < ny and elevated[li, lj]:
+                    lat_hits += 1
+            if lat_hits < n_lat:
+                continue
+            carve[i, j] = True
+    return carve
+
+
 def detect_stair_carveout(occupancy_grid, origin, resolution, robot_z,
                           forward_xy, center_cell, zspan_mask, cfg=None,
                           fallback_drop=0.4):
@@ -109,42 +159,12 @@ def detect_stair_carveout(occupancy_grid, origin, resolution, robot_z,
     elevated = np.isfinite(height) & (height > floor + cfg.min_rise)
     candidate = zspan_mask & elevated           # only elevated obstacle cells
 
-    carve = np.zeros((nx, ny), dtype=bool)
-    idxs = np.argwhere(candidate)
-    for (i, j) in idxs:
-        hc = height[i, j]
-        # (a) SUSTAINED: sample surface ahead; it must not return to floor and must
-        #     not jump more than climb_step_max in one step (else it's a wall face).
-        sustained = True
-        prev = hc
-        for s in range(1, n_fwd + 1):
-            ai = int(round(i + di_f * s))
-            aj = int(round(j + dj_f * s))
-            if not (0 <= ai < nx and 0 <= aj < ny):
-                sustained = False
-                break
-            ha = height[ai, aj]
-            if not np.isfinite(ha):
-                continue                        # unknown ahead: neither confirm nor break
-            if ha <= floor + cfg.return_tol:    # surface returned to floor -> bump, not step
-                sustained = False
-                break
-            if ha - prev > cfg.climb_step_max:  # too-tall single jump -> wall
-                sustained = False
-                break
-            prev = max(prev, ha)
-        if not sustained:
-            continue
-        # (b) LATERAL EXTENT: elevated across the corridor at this station.
-        lat_hits = 0
-        for t in range(-n_lat, n_lat + 1):
-            li = int(round(i + latv[0] * t))
-            lj = int(round(j + latv[1] * t))
-            if 0 <= li < nx and 0 <= lj < ny and elevated[li, lj]:
-                lat_hits += 1
-        if lat_hits < n_lat:                    # spans < half the tested lateral band
-            continue
-        carve[i, j] = True
+    carve = _carve_kernel(
+        height, elevated, candidate, float(floor),
+        float(di_f), float(dj_f), float(latv[0]), float(latv[1]),
+        int(n_fwd), int(n_lat),
+        float(cfg.return_tol), float(cfg.climb_step_max),
+    )
 
     # (c) drop tiny carved components (box-top sized survivors)
     if carve.any():
