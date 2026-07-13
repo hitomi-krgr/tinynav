@@ -1042,7 +1042,8 @@ class BackendNode(Ros2NodeManager):
             )
             self._planning_proc = self._launch_proc(
                 'planning',
-                ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py'],
+                ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py',
+                 '--ros-args', '-p', 'use_stair_carveout:=true'],
                 env=env,
             )
         elif self._sensor_mode == 'realsense':
@@ -1057,7 +1058,8 @@ class BackendNode(Ros2NodeManager):
             )
             self._planning_proc = self._launch_proc(
                 'planning',
-                ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py'],
+                ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py',
+                 '--ros-args', '-p', 'use_stair_carveout:=true'],
                 env=env,
             )
 
@@ -1129,7 +1131,8 @@ class BackendNode(Ros2NodeManager):
 
         self._planning_proc = self._launch_proc(
             'planning',
-            ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py'],
+            ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py',
+                 '--ros-args', '-p', 'use_stair_carveout:=true'],
             env=_env,
         )
         self._map_node_proc = self._launch_proc(
