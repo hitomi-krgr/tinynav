@@ -4,12 +4,13 @@ import time
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path, Odometry
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, Float32
 import numpy as np
 import sys
 import json
 
 import heapq
+from scipy.ndimage import distance_transform_edt
 from tinynav.core.math_utils import matrix_to_quat, msg2np, np2msg, estimate_pose, np2tf, rerank_by_pnp_inliers
 from sensor_msgs.msg import Image, CameraInfo
 from message_filters import TimeSynchronizer, Subscriber
@@ -266,6 +267,12 @@ class MapNode(Node):
         self.current_pose_pub = self.create_publisher(Odometry, "/mapping/current_pose", 10)
         self.global_plan_pub = self.create_publisher(Path, '/mapping/global_plan', 10)
         self.target_pose_pub = self.create_publisher(Odometry, "/control/target_pose", 10)
+
+        # Static openness prior: min obstacle-distance over the upcoming global segment,
+        # published for planning_node to size its safety radius in narrow corridors.
+        self.path_openness_pub = self.create_publisher(Float32, '/mapping/path_openness', 10)
+        self._openness2d = None       # lazily-built 2D obstacle EDT (m) over the robot z-band
+        self._openness_map_id = None  # id() of occupancy_map the EDT was built from
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -689,22 +696,94 @@ class MapNode(Node):
         })))
 
         max_speed = 0.5
-        accumulated_distance = 0.0
-        start_point = pos[:3]
-        target_position = paths[-1]
-        for i in range(closest_idx, len(paths) - 1):
-            accumulated_distance += np.linalg.norm(paths[i][:2] - start_point[:2])
-            if accumulated_distance > max_speed * 5:
-                target_position = paths[i]
-                break
-            start_point = paths[i]
+
+        # local target = furthest point on the path reachable from the robot before
+        # the heading turns past turn_thresh (a corner) or lookahead_max arc length is
+        # reached. Drives to corners instead of slicing across them.
+        local_i = self._local_target_index(paths, closest_idx, lookahead_max=max_speed * 5)
+        target_position = paths[local_i]
 
         T = self.latest_odom_pose @ np.linalg.inv(pose_in_map)
         target_position_in_odom = T[:3, :3] @ target_position + T[:3, 3]
         dummy_pose = np.eye(4)
         dummy_pose[:3, 3] = target_position_in_odom
         self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))
+
+        # Static openness prior over the robot -> local-target segment.
+        self._ensure_openness_map()
+        openness = self._path_openness(paths[closest_idx:local_i + 1])
+        if np.isfinite(openness):
+            self.path_openness_pub.publish(Float32(data=float(openness)))
         self.tf_broadcaster.sendTransform(np2tf(T, self.get_clock().now().to_msg(), "world", "map"))
+
+    def _local_target_index(self, path, start_i, lookahead_max, min_lookahead=1.0,
+                            turn_thresh=np.deg2rad(60.0), smooth_m=0.4):
+        """Index of the local target: walk forward from start_i, stop at the first
+        point (beyond min_lookahead) whose smoothed heading has turned >= turn_thresh
+        from the entry heading (a corner), or when lookahead_max arc length is reached.
+        Never returns a point closer than min_lookahead in arc length."""
+        pxy = [np.asarray(p[:2], dtype=np.float64) for p in path]
+        n = len(pxy)
+        cum = [0.0] * n
+        for i in range(start_i + 1, n):
+            cum[i] = cum[i - 1] + float(np.linalg.norm(pxy[i] - pxy[i - 1]))
+
+        def sdir(i):
+            j = i
+            while j < n - 1 and (cum[j] - cum[i]) < smooth_m:
+                j += 1
+            d = pxy[j] - pxy[i]
+            L = float(np.linalg.norm(d))
+            return d / L if L > 1e-6 else None
+
+        entry = sdir(start_i)
+        li = start_i
+        for k in range(start_i + 1, n):
+            if cum[k] - cum[start_i] >= lookahead_max:
+                li = k
+                break
+            dk = sdir(k)
+            if (cum[k] - cum[start_i]) >= min_lookahead and entry is not None and dk is not None:
+                turn = abs(np.arctan2(dk[0] * entry[1] - dk[1] * entry[0], float(dk @ entry)))
+                if turn >= turn_thresh:
+                    li = k
+                    break
+            li = k
+        return li
+
+    def _ensure_openness_map(self):
+        """Build a 2D obstacle-distance field (m) by collapsing occupied cells over a
+        z-band around the working height (median z of the recorded mapping poses) +-
+        0.4 m, then EDT. Reflects static corridor width. Recomputed whenever the
+        occupancy_map is reloaded (map switch / handoff)."""
+        if self._openness2d is not None and self._openness_map_id == id(self.occupancy_map):
+            return
+        self._openness_map_id = id(self.occupancy_map)
+        origin = self.occupancy_map_meta[:3]
+        res = float(self.occupancy_map_meta[3])
+        work_z = float(np.median([np.asarray(p)[2, 3] for p in self.map_poses.values()]))
+        z_dim = self.occupancy_map.shape[2]
+        z_world = origin[2] + (np.arange(z_dim) + 0.5) * res
+        band = (z_world >= work_z - 0.4) & (z_world <= work_z + 0.4)
+        if band.any():
+            occ2d = (self.occupancy_map[:, :, band] == 2).any(axis=2)
+        else:
+            occ2d = (self.occupancy_map == 2).any(axis=2)
+        self._openness2d = distance_transform_edt(~occ2d) * res
+
+    def _path_openness(self, path_in_map: np.ndarray) -> float:
+        """Min static obstacle-distance (m) over the given path segment."""
+        if self._openness2d is None or len(path_in_map) == 0:
+            return float('inf')
+        origin = self.occupancy_map_meta[:3]
+        res = float(self.occupancy_map_meta[3])
+        nx, ny = self._openness2d.shape
+        vals = []
+        for p in path_in_map:
+            ix = int((p[0] - origin[0]) / res); iy = int((p[1] - origin[1]) / res)
+            if 0 <= ix < nx and 0 <= iy < ny:
+                vals.append(float(self._openness2d[ix, iy]))
+        return min(vals) if vals else float('inf')
 
     def generate_nav_path_in_map(self, pose_in_map: np.ndarray, target_poi: np.ndarray) -> np.ndarray:
         dummy_poi_pose = np.eye(4)
