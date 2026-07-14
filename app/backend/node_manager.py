@@ -135,6 +135,7 @@ class BackendNode(Ros2NodeManager):
         self.create_subscription(
             OccupancyGrid, '/planning/obstacle_mask', self._on_obstacle_mask, 1
         )
+        self.create_subscription(Bool, '/planning/on_stairs', self._on_on_stairs, 10)
         self.create_subscription(Path, '/planning/trajectory_path', self._on_trajectory_path, 1)
         self.create_subscription(Path, '/mapping/global_plan', self._on_global_plan, 1)
         self.create_subscription(
@@ -190,6 +191,8 @@ class BackendNode(Ros2NodeManager):
         self._nav_nodes_running: bool = False
         self._map_node_proc: subprocess.Popen | None = None
         self._cmd_vel_proc: subprocess.Popen | None = None
+        self._stair_hint_proc: subprocess.Popen | None = None
+        self._on_stairs: bool = False
 
         self._nav_progress: dict | None = None
         self.nav_progress_callbacks: list = []
@@ -264,6 +267,10 @@ class BackendNode(Ros2NodeManager):
         with self._lock:
             self._map_pose = pose
             self._localized = True
+
+    def _on_on_stairs(self, msg: Bool):
+        with self._lock:
+            self._on_stairs = bool(msg.data)
 
     def _on_nav_target_pose(self, msg: Odometry):
         with self._lock:
@@ -631,6 +638,7 @@ class BackendNode(Ros2NodeManager):
             nav_nodes = self._nav_nodes_running
             nav_paused = self._nav_paused
             nav_active = self._nav_active
+            on_stairs = self._on_stairs
         bag_files_exist = self.active_bag_path is not None
         map_files_exist = os.path.exists(os.path.join(self.map_path, 'occupancy_grid.npy'))
         return {
@@ -644,6 +652,7 @@ class BackendNode(Ros2NodeManager):
             'navNodesRunning': nav_nodes,
             'navPaused': nav_paused,
             'navActive': nav_active,
+            'onStairs': on_stairs,
         }
 
     @staticmethod
@@ -749,6 +758,12 @@ class BackendNode(Ros2NodeManager):
             ],
             env=_env,
         )
+        self._stair_hint_proc = self._launch_proc(
+            'stair_hint',
+            ['uv', 'run', 'python', '/tinynav/tinynav/core/stair_hint_node.py',
+             '--tinynav_map_path', self.map_path],
+            env=_env,
+        )
         self._cmd_vel_proc = self._launch_proc(
             'cmd_vel_control',
             ['uv', 'run', 'python', '/tinynav/tinynav/platforms/cmd_vel_control.py'],
@@ -762,8 +777,10 @@ class BackendNode(Ros2NodeManager):
         self._set_nav_active(False)
         self._kill_proc(self._map_node_proc)
         self._kill_proc(self._cmd_vel_proc)
+        self._kill_proc(self._stair_hint_proc)
         self._map_node_proc = None
         self._cmd_vel_proc = None
+        self._stair_hint_proc = None
         with self._lock:
             self._nav_nodes_running = False
             self._localized = False
@@ -771,6 +788,7 @@ class BackendNode(Ros2NodeManager):
             self._global_path = []
             self._nav_target_pose = None
             self._nav_paused = False
+            self._on_stairs = False
         self.get_logger().info('Nav nodes stopped')
 
     def cmd_restart_nav_nodes(self):
@@ -778,9 +796,11 @@ class BackendNode(Ros2NodeManager):
         self._kill_proc(self._map_node_proc)
         self._kill_proc(self._planning_proc)
         self._kill_proc(self._cmd_vel_proc)
+        self._kill_proc(self._stair_hint_proc)
         self._map_node_proc = None
         self._planning_proc = None
         self._cmd_vel_proc = None
+        self._stair_hint_proc = None
 
         _env = os.environ.copy()
         _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
@@ -793,6 +813,12 @@ class BackendNode(Ros2NodeManager):
         self._map_node_proc = self._launch_proc(
             'map_node',
             ['uv', 'run', 'python', '/tinynav/tinynav/core/map_node.py',
+             '--tinynav_map_path', self.map_path],
+            env=_env,
+        )
+        self._stair_hint_proc = self._launch_proc(
+            'stair_hint',
+            ['uv', 'run', 'python', '/tinynav/tinynav/core/stair_hint_node.py',
              '--tinynav_map_path', self.map_path],
             env=_env,
         )
@@ -1142,7 +1168,7 @@ class NodeRunner:
                 self.node.destroy_node()
             except Exception:
                 pass
-            for proc in (self.node._looper_bridge_proc, self.node._realsense_proc, self.node._perception_proc, self.node._planning_proc, self.node._unitree_proc, self.node._map_node_proc, self.node._cmd_vel_proc):
+            for proc in (self.node._looper_bridge_proc, self.node._realsense_proc, self.node._perception_proc, self.node._planning_proc, self.node._unitree_proc, self.node._map_node_proc, self.node._cmd_vel_proc, self.node._stair_hint_proc):
                 if proc and proc.poll() is None:
                     try:
                         os.killpg(os.getpgid(proc.pid), 15)

@@ -36,6 +36,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from tinynav.core.math_utils import matrix_to_quat, msg2np, estimate_pose, tf2np, depth_to_cloud
 from tinynav.core.models_trt import LightGlueTRT, Dinov2TRT, SuperPointTRT
 from tinynav.core.planning_node import run_raycasting_loopy
+from tinynav.core.stair_hint import compute_path_climb
 from tinynav.tinynav_cpp_bind import pose_graph_solve
 from tool.video_db import VideoDB
 
@@ -847,6 +848,18 @@ class BuildMapNode(Node):
         self._global_prev_num_frames = len(self.pose_graph_used_pose)
 
         np.save(f"{self.map_save_path}/poses.npy", self.pose_graph_used_pose, allow_pickle = True)
+
+        # Stair hint: label each capture-path sample climbing/flat from the
+        # (loop-closed) pose trajectory. Rides on poses.npy; the nav-time
+        # stair_hint_node reads path_climb.npy to gate z-span strictness.
+        try:
+            path_climb = compute_path_climb(self.pose_graph_used_pose)
+            np.save(f"{self.map_save_path}/path_climb.npy", path_climb)
+            n_climb = int((path_climb[:, 3] >= 0.5).sum())
+            self.get_logger().info(f"Saved path_climb.npy ({n_climb}/{len(path_climb)} samples climbing)")
+        except Exception as e:
+            self.get_logger().error(f"Failed to compute path_climb: {e}")
+
         np.save(f"{self.map_save_path}/intrinsics.npy", self.K)
         np.save(f"{self.map_save_path}/baseline.npy", self.baseline)
         print(f"T_rgb_to_infra1: {self.T_rgb_to_infra1}")
