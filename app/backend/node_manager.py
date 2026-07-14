@@ -1080,24 +1080,27 @@ class BackendNode(Ros2NodeManager):
     # Nav nodes toggle                                                     #
     # ------------------------------------------------------------------ #
 
-    def cmd_start_nav_nodes(self):
-        self._set_nav_active(False)
-        _env = os.environ.copy()
-        _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
+    def _launch_map_nodes(self, env):
+        """Launch the map-artifact-bound nodes (map_node + stair_hint) as a pair,
+        so no nav-launch path can spawn map_node without the stair hint."""
         self._map_node_proc = self._launch_proc(
             'map_node',
-            [
-                'uv', 'run', 'python', '/tinynav/tinynav/core/map_node.py',
-                '--tinynav_map_path', self.map_path,
-            ],
-            env=_env,
+            ['uv', 'run', 'python', '/tinynav/tinynav/core/map_node.py',
+             '--tinynav_map_path', self.map_path],
+            env=env,
         )
         self._stair_hint_proc = self._launch_proc(
             'stair_hint',
             ['uv', 'run', 'python', '/tinynav/tinynav/core/stair_hint_node.py',
              '--tinynav_map_path', self.map_path],
-            env=_env,
+            env=env,
         )
+
+    def cmd_start_nav_nodes(self):
+        self._set_nav_active(False)
+        _env = os.environ.copy()
+        _env['PYTHONPATH'] = _VENV_SITE + ':' + _env.get('PYTHONPATH', '')
+        self._launch_map_nodes(_env)
         with self._lock:
             loc_assist = self._loc_assist_enabled
         if loc_assist:
@@ -1152,18 +1155,7 @@ class BackendNode(Ros2NodeManager):
             ['uv', 'run', 'python', '/tinynav/tinynav/core/planning_node.py'],
             env=_env,
         )
-        self._map_node_proc = self._launch_proc(
-            'map_node',
-            ['uv', 'run', 'python', '/tinynav/tinynav/core/map_node.py',
-             '--tinynav_map_path', self.map_path],
-            env=_env,
-        )
-        self._stair_hint_proc = self._launch_proc(
-            'stair_hint',
-            ['uv', 'run', 'python', '/tinynav/tinynav/core/stair_hint_node.py',
-             '--tinynav_map_path', self.map_path],
-            env=_env,
-        )
+        self._launch_map_nodes(_env)
         self._cmd_vel_proc = self._launch_proc(
             'cmd_vel_control',
             ['uv', 'run', 'python', '/tinynav/tinynav/platforms/cmd_vel_control.py'],

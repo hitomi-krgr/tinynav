@@ -15,12 +15,12 @@ import argparse
 import logging
 import os
 
-import numpy as np
 import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from std_msgs.msg import Bool
 
+from tinynav.core.math_utils import msg2np
 from tinynav.core.stair_hint import PathClimbIndex
 
 
@@ -45,8 +45,8 @@ class StairHintNode(Node):
         self._last = None
 
     def _on_pose(self, msg: Odometry):
-        p = msg.pose.pose.position
-        on = bool(self.index.on_stairs(np.array([p.x, p.y, p.z]))) if self.index else False
+        T, _ = msg2np(msg)
+        on = bool(self.index.on_stairs(T[:3, 3])) if self.index else False
         self.on_stairs_pub.publish(Bool(data=on))
         if on != self._last:
             self.get_logger().info(f"on_stairs -> {on}")

@@ -29,11 +29,8 @@ ASSOC_M = 1.5          # nav-time trajectory-association radius: how close the r
 def poses_to_positions(poses) -> np.ndarray:
     """poses: dict{timestamp:int -> 4x4} (as saved by build_map). Returns (N,3)
     translations ordered by timestamp (== capture order)."""
-    if isinstance(poses, dict):
-        keys = sorted(poses.keys())
-        return np.array([np.asarray(poses[k])[:3, 3] for k in keys], dtype=np.float64)
-    arr = np.asarray(poses, dtype=np.float64)
-    return arr[:, :3, 3] if arr.ndim == 3 else arr[:, :3]
+    keys = sorted(poses.keys())
+    return np.array([np.asarray(poses[k])[:3, 3] for k in keys], dtype=np.float64)
 
 
 def compute_path_climb(poses, win_m=WIN_M, min_rise=MIN_RISE,
