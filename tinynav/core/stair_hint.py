@@ -21,7 +21,10 @@ WIN_M = 1.0            # half-window horizontal arclength (m)
 MIN_RISE = 0.25        # min sustained net |dz| over the window to call it climbing (m)
 CONSISTENCY = 0.6      # min fraction of in-window steps whose dz sign matches the net
 MAX_STEP_DZ = 0.5      # a single consecutive |dz| above this = VIO teleport -> not climbing
-QUERY_MAX_XY = 1.5     # nav-time: if nearest path sample is farther than this (m), off-path -> flat/strict
+LOOKAHEAD_M = 1.5      # nav-time lead: on_stairs fires if a climbing sample is within this
+                       # 3D radius of the robot -> opens z-span ~this far before the flight.
+                       # Note the +/-WIN_M labelling window already spreads climbing labels
+                       # ~WIN_M ahead of the first riser, so effective lead ~= WIN_M + this.
 
 
 def poses_to_positions(poses) -> np.ndarray:
@@ -73,26 +76,25 @@ def compute_path_climb(poses, win_m=WIN_M, min_rise=MIN_RISE,
 
 
 class PathClimbIndex:
-    """Nav-time lookup: nearest labelled capture-path sample to a map-frame pose."""
+    """Nav-time lookup: is a climbing-labelled capture-path sample near the robot?"""
 
-    def __init__(self, path_climb: np.ndarray, query_max_xy: float = QUERY_MAX_XY):
+    def __init__(self, path_climb: np.ndarray, lookahead_m: float = LOOKAHEAD_M):
         self.pts = np.asarray(path_climb, dtype=np.float64)
-        self.query_max_xy = float(query_max_xy)
+        self.lookahead_m = float(lookahead_m)
+        climb = self.pts[:, 3] >= 0.5 if self.pts.shape[0] else np.zeros(0, bool)
+        self._climb_xyz = self.pts[climb, :3]      # (M,3) climbing samples only
 
     @classmethod
     def load(cls, npy_path: str, **kw) -> "PathClimbIndex":
         return cls(np.load(npy_path), **kw)
 
     def on_stairs(self, position_xyz) -> bool:
-        """True if the nearest capture-path sample (within query_max_xy in XY,
-        matched using full 3D so stacked floors don't alias) is labelled climbing.
-        Off-path / no data -> False (unknown => strict z-span, the safe default)."""
-        if self.pts.shape[0] == 0:
+        """True if any climbing-labelled capture-path sample is within lookahead_m
+        (full 3D distance, so stacked floors don't alias) of the robot -> gives a
+        ~lookahead_m lead before the flight. Off-path / no data -> False (unknown
+        => strict z-span, the safe default)."""
+        if self._climb_xyz.shape[0] == 0:
             return False
         p = np.asarray(position_xyz, dtype=np.float64)[:3]
-        d3 = np.linalg.norm(self.pts[:, :3] - p, axis=1)
-        i = int(np.argmin(d3))
-        dxy = np.linalg.norm(self.pts[i, :2] - p[:2])
-        if dxy > self.query_max_xy:
-            return False
-        return bool(self.pts[i, 3] >= 0.5)
+        d3 = np.linalg.norm(self._climb_xyz - p, axis=1)
+        return bool(d3.min() <= self.lookahead_m)

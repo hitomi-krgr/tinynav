@@ -2,9 +2,9 @@
 flight, per the offline capture-path climb labels (path_climb.npy)?
 
 Subscribes /mapping/current_pose_in_map (robot pose in MAP frame, same frame as
-poses.npy) and looks up the nearest labelled capture-path sample. The look-ahead
-is baked into the offline label window, so a current-pose lookup already leads
-the robot. Off-path / no map data -> False (=> strict z-span, the safe default).
+poses.npy) and fires when a climbing-labelled capture-path sample is within
+PathClimbIndex.lookahead_m (~1.5 m) of the robot, giving a lead before the
+flight. Off-path / no map data -> False (=> strict z-span, the safe default).
 
 Consumers: the app backend (frontend indicator) and, later, planning_node
 (relax z-span when on stairs, tighten otherwise).
