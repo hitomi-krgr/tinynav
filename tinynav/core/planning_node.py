@@ -458,22 +458,15 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
-        # Stair hint (from stair_hint_node, gated by the offline capture-path climb
-        # labels). When active, relax the obstacle z-span filter so the ascending
-        # staircase's stacked z-structure stops reading as a wall: only near-full-
-        # height verticals (real walls) block, low protrusions pass (low-level
-        # locomotion handles the climb). This is a GLOBAL span switch, not spatial,
-        # so low obstacles ON the stair region are intentionally not caught while
-        # climbing (de-scoped). Off by default -> strict, safe.
-        # The relaxed span is raised above the strict default (0.2) so a stair
-        # column's z-span falls below the wall threshold while taller verticals
-        # still block.
+        # Stair hint from stair_hint_node: when active, relax the obstacle z-span
+        # filter (raise min_wall_span_m above the strict default) so the ascending
+        # staircase stops reading as a wall while taller verticals still block.
+        # GLOBAL span switch, not spatial -> low obstacles ON the stair region are
+        # intentionally not caught while climbing (de-scoped). Enter is immediate
+        # (the offline window bakes look-ahead); exit is debounced by stair_hold_s
+        # and self-heals to the strict default when the stream stops or goes stale.
         self.declare_parameter('stair_min_wall_span_m', 0.3)
-        stair_span = float(self.get_parameter('stair_min_wall_span_m').value)
-        self._stair_obstacle_config = replace(self.obstacle_config, min_wall_span_m=stair_span)
-        # Consumer-side exit debounce: stay relaxed for this long after the last
-        # on_stairs=True. Enter is immediate (the offline window bakes look-ahead).
-        # The signal self-heals to strict when the stream stops or goes stale.
+        self._stair_min_wall_span_m = float(self.get_parameter('stair_min_wall_span_m').value)
         self.declare_parameter('stair_hold_s', 1.5)
         self._stair_hold_ns = int(float(self.get_parameter('stair_hold_s').value) * 1e9)
         self._on_stairs_true_stamp_ns = None
@@ -481,15 +474,13 @@ class PlanningNode(Node):
 
     # --- callbacks ---------------------------------------------------------
     def on_stairs_callback(self, msg):
-        # Only latch the True edge's timestamp; the trailing hold window (checked in
-        # _on_stairs_active) provides the exit debounce and staleness fallback.
+        # Latch only the True edge; _on_stairs_active's hold window gives the exit
+        # debounce and staleness fallback.
         if msg.data:
             self._on_stairs_true_stamp_ns = self.get_clock().now().nanoseconds
 
     def _on_stairs_active(self):
-        if self._on_stairs_true_stamp_ns is None:
-            return False
-        return self.get_clock().now().nanoseconds - self._on_stairs_true_stamp_ns <= self._stair_hold_ns
+        return self._signal_fresh(self._on_stairs_true_stamp_ns, self._stair_hold_ns)
 
     def poi_change_callback(self, msg):
         self.target_pose = None
@@ -504,14 +495,19 @@ class PlanningNode(Node):
         self._nav_openness = float(msg.data)
         self._nav_openness_stamp_ns = self.get_clock().now().nanoseconds
 
+    def _signal_fresh(self, stamp_ns, window_ns):
+        """True if a signal last stamped at stamp_ns is still within window_ns of
+        now. Never-received (stamp_ns None) -> stale, the safe default."""
+        if stamp_ns is None:
+            return False
+        return self.get_clock().now().nanoseconds - stamp_ns <= window_ns
+
     def _effective_safety_radius(self):
         # Static openness prior (m) -> safety_radius. Tighten toward narrow corridors:
         # safety = clip((openness - robot.width) * 0.75, base*0.75, base). Falls back to
         # base when no openness has been received or the last one is stale.
         b = self._safety_base
-        if self._nav_openness is None or self._nav_openness_stamp_ns is None:
-            return b
-        if self.get_clock().now().nanoseconds - self._nav_openness_stamp_ns > self._openness_ttl_ns:
+        if self._nav_openness is None or not self._signal_fresh(self._nav_openness_stamp_ns, self._openness_ttl_ns):
             return b
         return min(b, max(b * 0.75, (self._nav_openness - self.robot.width) * 0.75))
 
@@ -695,7 +691,8 @@ class PlanningNode(Node):
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             on_stairs = self._on_stairs_active()
-            obstacle_config = self._stair_obstacle_config if on_stairs else self.obstacle_config
+            obstacle_config = (replace(self.obstacle_config, min_wall_span_m=self._stair_min_wall_span_m)
+                               if on_stairs else self.obstacle_config)
             obstacle_mask = build_obstacle_map(
                 self.occupancy_grid, self.origin, self.resolution,
                 robot_z=T[2, 3], config=obstacle_config,
