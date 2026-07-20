@@ -8,7 +8,7 @@ to a hard collision filter and a reverse gate.
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt, binary_dilation
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numba import njit
 import cv2
 import rclpy
@@ -18,7 +18,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import Image, CameraInfo, PointField, PointCloud2, PointCloud
 from nav_msgs.msg import Path, Odometry, OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Point32, Twist
-from std_msgs.msg import Header, Float32
+from std_msgs.msg import Header, Float32, Bool
 from cv_bridge import CvBridge
 import sensor_msgs_py.point_cloud2 as pc2
 from codetiming import Timer
@@ -458,7 +458,39 @@ class PlanningNode(Node):
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
+        # Stair hint (from stair_hint_node, gated by the offline capture-path climb
+        # labels). When active, relax the obstacle z-span filter so the ascending
+        # staircase's stacked z-structure stops reading as a wall: only near-full-
+        # height verticals (real walls) block, low protrusions pass (low-level
+        # locomotion handles the climb). This is a GLOBAL span switch, not spatial,
+        # so low obstacles ON the stair region are intentionally not caught while
+        # climbing (de-scoped). Off by default -> strict, safe.
+        # The relaxed span is raised above the strict default (0.2) so a stair
+        # column's z-span falls below the wall threshold while taller verticals
+        # still block.
+        self.declare_parameter('stair_min_wall_span_m', 0.3)
+        stair_span = float(self.get_parameter('stair_min_wall_span_m').value)
+        self._stair_obstacle_config = replace(self.obstacle_config, min_wall_span_m=stair_span)
+        # Consumer-side exit debounce: stay relaxed for this long after the last
+        # on_stairs=True. Enter is immediate (the offline window bakes look-ahead).
+        # The signal self-heals to strict when the stream stops or goes stale.
+        self.declare_parameter('stair_hold_s', 1.5)
+        self._stair_hold_ns = int(float(self.get_parameter('stair_hold_s').value) * 1e9)
+        self._on_stairs_true_stamp_ns = None
+        self.create_subscription(Bool, '/planning/on_stairs', self.on_stairs_callback, 10)
+
     # --- callbacks ---------------------------------------------------------
+    def on_stairs_callback(self, msg):
+        # Only latch the True edge's timestamp; the trailing hold window (checked in
+        # _on_stairs_active) provides the exit debounce and staleness fallback.
+        if msg.data:
+            self._on_stairs_true_stamp_ns = self.get_clock().now().nanoseconds
+
+    def _on_stairs_active(self):
+        if self._on_stairs_true_stamp_ns is None:
+            return False
+        return self.get_clock().now().nanoseconds - self._on_stairs_true_stamp_ns <= self._stair_hold_ns
+
     def poi_change_callback(self, msg):
         self.target_pose = None
 
@@ -662,9 +694,11 @@ class PlanningNode(Node):
             self.publish_3d_occupancy_cloud(self.occupancy_grid, self.resolution, self.origin)
 
         with Timer(name='obstacle map', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
+            on_stairs = self._on_stairs_active()
+            obstacle_config = self._stair_obstacle_config if on_stairs else self.obstacle_config
             obstacle_mask = build_obstacle_map(
                 self.occupancy_grid, self.origin, self.resolution,
-                robot_z=T[2, 3], config=self.obstacle_config,
+                robot_z=T[2, 3], config=obstacle_config,
             )
             ESDF_map = distance_transform_edt(~obstacle_mask).astype(np.float32) * self.resolution
 
@@ -760,7 +794,8 @@ class PlanningNode(Node):
             self.get_logger().info(
                 f'sel vx={params[top_indices[0]][0]:.2f} omega={params[top_indices[0]][1]:.2f} '
                 f'feasible={len(feasible)} fwd_feasible={n_fwd_feasible} '
-                f'should_reverse={should_reverse} check_steps={self._collision_check_steps}'
+                f'should_reverse={should_reverse} check_steps={self._collision_check_steps} '
+                f'on_stairs={on_stairs}'
             )
 
             # velocity feedforward for cmd_vel_control: (vx, omega) of the selected
